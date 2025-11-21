@@ -1,0 +1,1036 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>JetLinksAI · RTSP安防盒子版 · 控制台</title>
+<style>
+  :root { --bg:#0b1116; --panel:#0f1720; --muted:#6b7280; --ok:#16a34a; --warn:#d97706; --err:#dc2626; --acc:#3b82f6; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:#e5e7eb; font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,"PingFang SC","Microsoft YaHei",sans-serif; }
+  header { padding:16px 20px; border-bottom:1px solid #111827; display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+  header h1 { margin:0; font-size:16px; font-weight:600; }
+  main { display:grid; grid-template-columns: 540px 1fr; gap:16px; padding:16px; }
+  .card { background:var(--panel); border:1px solid #111827; border-radius:12px; padding:12px; }
+  .card h2 { margin:0 0 10px; font-size:14px; font-weight:600; color:#cbd5e1; }
+  .row { display:flex; gap:8px; align-items:center; margin:8px 0; }
+  .row > label { min-width:140px; color:#cbd5e1; font-size:13px; line-height:1.4; }
+  input[type="text"], input[type="number"], select, textarea {
+    width:100%; padding:8px 10px; color:#e5e7eb; background:#0b1220; border:1px solid #172033; border-radius:8px; font-size:13px;
+  }
+  textarea.prompt { min-height: 120px; }
+  button { padding:8px 12px; border:none; border-radius:8px; background:var(--acc); color:#fff; cursor:pointer; font-weight:600; font-size:13px; }
+  button.secondary { background:#1f2937; color:#d1d5db; }
+  button.ghost { background:transparent; border:1px dashed #334155; color:#9ca3af; }
+  button:disabled { opacity:.6; cursor:not-allowed; }
+  .muted { color:var(--muted); font-size:12px; line-height:1.4; }
+  .ok { color:#86efac; font-size:12px; }
+  .err { color:#fca5a5; font-size:12px; }
+  .pill { padding:4px 8px; border-radius:999px; background:#0b1220; border:1px solid #172033; color:#9ca3af; font-size:12px; font-weight:500; }
+  .hr { height:1px; background:#111827; margin:12px 0; }
+  .grid2 { display:grid; grid-template-columns: 1fr 1fr; gap:8px; }
+  .grid3 { display:grid; grid-template-columns: 1fr 1fr 1fr; gap:8px; }
+
+  /* 让 grid3 内的 .row 使用两列布局，避免输入被挤压到 0 宽 */
+  .grid3 .row {
+    display: grid !important;
+    grid-template-columns: 160px minmax(0,1fr);
+    align-items: center;
+    gap: 8px;
+  }
+  /* 防止控件被压扁 */
+  .row input, .row select, .row textarea { min-width: 0; }
+
+  .right-col { display:flex; flex-direction:column; gap:12px; }
+  .info { background:#0b1220; border:1px solid #172033; border-radius:10px; padding:10px; display:flex; gap:12px; align-items:flex-start; flex-wrap:wrap; }
+  .kv { display:flex; gap:6px; align-items:center; background:#0b1220; border:1px solid #172033; padding:6px 8px; border-radius:8px; font-size:12px; }
+  .kv strong { color:#cbd5e1; }
+  .legend { display:flex; gap:8px; flex-wrap:wrap; }
+  .legend .kv { background:#0c1320; }
+
+  .events { height:calc(100vh - 255px); overflow:auto; background:#0b1220; border:1px solid #172033; border-radius:10px; padding:10px; }
+
+  /* SSE 标题右侧轮次标签 */
+  #sseRoundLabel { margin-left:8px; font-size:12px; color:#9ca3af; font-weight:400; }
+
+  /* 每条事件 */
+  .event-card {
+    border:1px solid #273244;
+    background:#0c1320;
+    border-radius:10px;
+    padding:12px;
+    margin:12px 0;
+    display:grid;
+    grid-template-columns: 1fr 380px;
+    gap:12px;
+  }
+  .event-head { display:flex; align-items:center; gap:8px; margin-bottom:6px; }
+  .badge {
+    display:inline-flex; align-items:center; gap:6px;
+    padding:2px 8px; border-radius:999px; font-size:12px; font-weight:700;
+    background:rgba(59,130,246,.12); color:#93c5fd; border:1px solid rgba(59,130,246,.35);
+  }
+  .seg { color:#94a3b8; font-weight:600; font-size:12px; }
+  .event-meta { margin-left:auto; font-size:12px; color:#94a3b8; display:flex; gap:10px; flex-wrap:wrap; line-height:1.4; }
+  .event-desc { font-size:13px; color:#e5e7eb; line-height:1.6; white-space:pre-wrap; }
+  .event-sugg { margin-top:6px; font-size:12px; color:#cbd5e1; line-height:1.4; }
+
+  .badge-lvl { padding:2px 8px; border-radius:999px; font-size:12px; font-weight:700; border:1px solid透明; line-height:1.3; }
+  .lvl-low    { background:rgba(139,92,246,.12); color:#c4b5fd; border-color:rgba(139,92,246,.35); }
+  .lvl-med    { background:rgba(217,119,6,.12);  color:#fdba74; border-color:rgba(217,119,6,.35); }
+  .lvl-high   { background:rgba(239,68,68,.12);  color:#fca5a5; border-color:rgba(239,68,68,.45); }
+  .lvl-crit   { background:rgba(153,27,27,.18);  color:#fecaca; border-color:rgba(153,27,27,.45); }
+  .lvl-norisk {background:rgba(15,23,42,.6);color:#e5e7eb;border-color:#475569;}
+
+  .evidence-wrap { display:grid; grid-template-columns: 1fr; gap:8px; align-content:start; }
+  .evidence-grid { display:grid; grid-template-columns: repeat(2, 1fr); gap:8px; }
+  .evidence-item a { display:block; width:100%; }
+  .evidence-item img { width:100%; height:150px; object-fit:cover; border-radius:8px; border:1px solid #172033; }
+
+  /* 轮询模式下：按流划分的面板 */
+  .stream-panel {
+    border:1px solid #1f2933;
+    border-radius:10px;
+    padding:8px;
+    margin-bottom:10px;
+    background:#020617;
+  }
+  .stream-panel-header {
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    margin-bottom:4px;
+    font-size:12px;
+    color:#9ca3af;
+    gap:8px;
+  }
+  .stream-panel-title {
+    font-weight:600;
+    color:#e5e7eb;
+  }
+  .stream-panel-stat {
+    display:flex;
+    gap:10px;
+    flex-wrap:wrap;
+  }
+  .stream-panel-stat span { white-space:nowrap; }
+  .stream-panel-events { margin-top:4px; }
+
+</style>
+</head>
+<body>
+<header>
+  <h1>JetLinksAI RTSP安防 · 控制台🤖</h1>
+  <span class="pill">RTSP单流常驻、多流轮询、实时热更新、离线音视频分析</span>
+</header>
+
+<main>
+  <!-- 左侧：启动与控制 -->
+  <section class="card" style="max-height:calc(100vh - 64px); overflow:auto;">
+    <h2>① 启动 · security_single</h2>
+    <form id="formSingle">
+      <div class="row"><label>RTSP</label><input type="text" id="single_rtsp" placeholder="rtsp://user:pass@ip/..." required></div>
+      <div class="row"><label>别名（前端展示）</label><input type="text" id="single_alias" placeholder="如：东门-001"></div>
+
+      <div class="row"><label>提示词（自定义）</label><input type="text" id="single_prompt" placeholder="留空则使用下方预设"></div>
+
+      <div class="row"><label>Preset</label>
+        <select id="single_preset">
+          <option value="FACTORY_SECURITY">工厂安防</option>
+          <option value="RESIDENTIAL_SECURITY">小区安防</option>
+          <option value="OFFICE_PRODUCTIVITY_COMPLIANT">办公区秩序与占用</option>
+          <option value="CONSTRUCTION_PPE">施工现场 PPE 与三违</option>
+          <option value="RETAIL_LOSS_PREVENTION">零售门店 防损与陈列合规</option>
+          <option value="TRAFFIC_INTERSECTION">交通路口 态势与风险</option>
+          <option value="WAREHOUSE_SAFETY">仓储作业 安全与效率</option>
+          <option value="LAB_DATACENTER_SAFETY">实验室与机房 安全合规</option>
+          <option value="MANUFACTURING_QA">生产线 外观质检与工位异常</option>
+          <option value="HEALTHCARE_PUBLIC_SAFETY">医疗养老机构 公共安全</option>
+        </select>
+      </div>
+
+      <div class="row"><label>每轮切片数</label><input type="number" id="single_cutnum" min="1" max="10" value="1"></div>
+
+      <div class="row"><label>后端</label>
+        <select id="single_backend">
+          <option value="local">本地</option>
+          <option value="cloud" selected>云端</option>
+        </select>
+      </div>
+
+      <div class="row" id="rowSingleLocal">
+        <label>本地模型</label>
+        <select id="single_local_model">
+          <option value="QWEN3_VL_4B" selected>QWEN3_VL_4B</option>
+          <option value="QWEN3_VL_8B">QWEN3_VL_8B</option>
+        </select>
+      </div>
+      <div class="row" id="rowSingleCloud" style="display:none;">
+        <label>云端模型</label>
+        <select id="single_cloud_model">
+          <option value="QWEN3_VL_PLUS" selected>qwen3-vl-plus</option>
+          <option value="QWEN_VL_MAX">qwen-vl-max</option>
+          <option value="QWEN_VL_PLUS">qwen-vl-plus</option>
+        </select>
+      </div>
+
+      <div class="row"><label>基本切窗大小(s)</label>
+        <input type="number" step="0.5" min="1" id="single_cutwin" value="4.0" inputmode="decimal">
+      </div>
+      <div class="row"><label>RGB颜色关注权重 α</label>
+        <input type="number" step="0.05" min="0" max="1" id="single_alpha" value="0.5" inputmode="decimal">
+      </div>
+      <div class="row"><label>关键帧数量</label>
+        <input type="number" id="single_topk" value="1" min="1" max="8" step="1" inputmode="numeric">
+      </div>
+
+      <div class="row"><label>最小事件等级</label>
+        <select id="single_minlvl">
+          <option value="NO_RISK">无风险</option>
+          <option value="LOW" selected>低风险</option>
+          <option value="MEDIUM">中风险</option>
+          <option value="HIGH">高风险</option>
+          <option value="CRITICAL">严重风险</option>
+        </select>
+      </div>
+      <div class="row"><button type="submit">启动 single</button></div>
+    </form>
+
+    <div class="hr"></div>
+
+    <h2>② 启动 · security_polling</h2>
+    <div class="muted">至少 2 路；每一路都可独立自定义或选择预设；支持运行期增删改与改“轮询间隔”。</div>
+    <div id="pollingList"></div>
+    <div class="grid3" style="margin:8px 0;">
+      <button type="button" class="ghost" id="btnAddRow">+ 新增路</button>
+      <button type="button" class="ghost" id="btnDelLast">- 删除末尾</button>
+      <button type="button" class="ghost" id="btnClearAll">清空</button>
+    </div>
+    <form id="formPolling">
+      <div class="row"><label>后端</label>
+        <select id="poll_backend">
+          <option value="local">本地</option>
+          <option value="cloud" selected>云端</option>
+        </select>
+      </div>
+      <div class="row" id="rowPollLocal">
+        <label>本地模型</label>
+        <select id="poll_local_model">
+          <option value="QWEN3_VL_4B" selected>QWEN3_VL_4B</option>
+          <option value="QWEN3_VL_8B">QWEN3_VL_8B</option>
+        </select>
+      </div>
+      <div class="row" id="rowPollCloud" style="display:none;">
+        <label>云端模型</label>
+        <select id="poll_cloud_model">
+          <option value="QWEN3_VL_PLUS" selected>qwen3-vl-plus</option>
+          <option value="QWEN_VL_MAX">qwen-vl-max</option>
+          <option value="QWEN_VL_PLUS">qwen-vl-plus</option>
+        </select>
+      </div>
+
+      <div class="row"><label>基本切窗大小(s)</label>
+        <input type="number" step="0.5" min="1" id="poll_cutwin" value="4.0" inputmode="decimal">
+      </div>
+      <div class="row"><label>RGB颜色关注权重 α</label>
+        <input type="number" step="0.05" min="0" max="1" id="poll_alpha" value="0.5" inputmode="decimal">
+      </div>
+      <div class="row"><label>关键帧数量</label>
+        <input type="number" id="poll_topk" value="1" min="1" max="8" step="1" inputmode="numeric">
+      </div>
+
+      <div class="row"><label>最小事件等级</label>
+        <select id="poll_minlvl">
+          <option value="NO_RISK">无风险</option>
+          <option value="LOW" selected>低风险</option>
+          <option value="MEDIUM">中风险</option>
+          <option value="HIGH">高风险</option>
+          <option value="CRITICAL">严重</option>
+        </select>
+      </div>
+      <div class="row"><label>轮询间隔(s ≥10)</label><input type="number" id="poll_interval" min="10" value="15" step="1" inputmode="numeric"></div>
+      <div class="row"><button type="submit">启动 polling</button></div>
+    </form>
+
+    <div class="hr"></div>
+
+    <h2>③ 离线 · 音视频</h2>
+    <form id="formOffline">
+      <div class="row"><label>上传文件</label><input type="file" id="off_file" accept=".mp4,.avi,.mkv,.mov,.flv,.mp3,.wav,.aac,.flac,.ogg"></div>
+      <div class="row"><label>或本地路径</label><input type="text" id="off_path" placeholder="/abs/path/to/media.[mp4|mp3]"></div>
+
+      <!-- 视频专用配置（音频时可忽略，前端仍会传 cut/alpha/topk）-->
+      <div class="row"><label>系统提示词（视频）</label><input type="text" id="off_sys_prompt" placeholder="留空则使用默认描述提示词"></div>
+      <div class="row"><label>后端（视频）</label>
+        <select id="off_backend">
+          <option value="local">本地</option>
+          <option value="cloud"selected>云端</option>
+        </select>
+      </div>
+      <div class="row" id="rowOffLocal">
+        <label>本地模型</label>
+        <select id="off_local_model">
+          <option value="QWEN3_VL_4B" selected>QWEN3_VL_4B</option>
+          <option value="QWEN3_VL_8B">QWEN3_VL_8B</option>
+        </select>
+      </div>
+      <div class="row" id="rowOffCloud" style="display:none;">
+        <label>云端模型</label>
+        <select id="off_cloud_model">
+          <option value="QWEN3_VL_PLUS" selected>qwen3-vl-plus</option>
+          <option value="QWEN_VL_MAX">qwen-vl-max</option>
+          <option value="QWEN_VL_PLUS">qwen-vl-plus</option>
+        </select>
+      </div>
+
+      <div class="row"><label>基本切窗大小(s)</label>
+        <input type="number" step="0.5" min="1" id="off_cutwin" value="6.0" inputmode="decimal">
+      </div>
+      <div class="row"><label>RGB颜色关注权重 α</label>
+        <input type="number" step="0.05" min="0" max="1" id="off_alpha" value="0.5" inputmode="decimal">
+      </div>
+      <div class="row"><label>关键帧数量</label>
+        <input type="number" id="off_topk" value="3" min="1" max="8" step="1" inputmode="numeric">
+      </div>
+
+      <div class="row"><button type="submit">启动离线任务</button></div>
+      <div class="muted">说明：视频会触发 VLM 视觉描述（B 线程）；音频只触发 ASR（C 线程）。</div>
+    </form>
+
+    <div class="hr"></div>
+
+    <h2>④ 运行期控制 · 当前 Job</h2>
+    <div class="row">
+      <label>激活 Job</label>
+      <select id="jobsSelect"></select>
+      <button type="button" class="secondary" id="btnRefreshJobs">刷新</button>
+    </div>
+    <div class="grid3">
+      <button type="button" class="secondary" id="btnPause">暂停</button>
+      <button type="button" class="secondary" id="btnResume">恢复</button>
+      <button type="button" class="secondary" id="btnStopJob">停止Job</button>
+    </div>
+
+    <div class="hr"></div>
+
+    <h2>⑤ 运行期 · 轮询专用控制</h2>
+    <div class="row"><label>改轮询间隔(s ≥10)</label><input type="number" id="ctl_interval" min="10" value="15" step="1"><button type="button" id="btnSetInterval">设置</button></div>
+
+    <div class="row"><label>新增流</label></div>
+    <div class="grid3">
+      <input type="text" id="ctl_add_url" placeholder="rtsp://...">
+      <input type="text" id="ctl_add_alias" placeholder="别名(前端)">
+      <input type="text" id="ctl_add_prompt" placeholder="提示词（可填预设名或自定义）">
+    </div>
+    <div class="row"><label>每轮切片数</label><input type="number" id="ctl_add_cutnum" min="1" max="10" value="1"><button type="button" id="btnAddStream">新增</button></div>
+
+    <div class="row"><label>删除流（按URL）</label><input type="text" id="ctl_del_url" placeholder="rtsp://..."><button type="button" id="btnDelStream">删除</button></div>
+
+    <div class="row"><label>更新流（单/轮询通用）</label></div>
+    <div class="grid3">
+      <input type="text" id="ctl_upd_old" placeholder="旧URL（或留空用索引）">
+      <input type="number" id="ctl_upd_idx" placeholder="索引(可选)" min="0" step="1">
+      <input type="text" id="ctl_upd_newurl" placeholder="新URL">
+    </div>
+    <div class="grid3">
+      <input type="text" id="ctl_upd_alias" placeholder="新别名(前端)">
+      <input type="text" id="ctl_upd_prompt" placeholder="新提示词（可填预设名或自定义）">
+      <input type="number" id="ctl_upd_cutnum" placeholder="新切片数" min="1" max="10" step="1">
+    </div>
+    <div class="row"><button type="button" id="btnUpdStream">执行更新</button></div>
+
+    <div class="hr"></div>
+    <h2>⑥ 统计/全停</h2>
+    <div class="grid3">
+      <button type="button" class="secondary" id="btnStats">获取统计</button>
+      <button type="button" class="secondary" id="btnResetStats">重置统计</button>
+      <button type="button" class="secondary" id="btnStopAll">全停</button>
+    </div>
+
+    <div class="hr"></div>
+    <div class="muted" id="status"></div>
+  </section>
+
+  <!-- 右侧：信息条 + 事件面板 -->
+  <section class="right-col">
+    <div class="info" id="infoBar" style="display:none;">
+      <div class="kv"><strong>Job</strong><span id="inf_job">—</span></div>
+      <div class="kv"><strong>模式</strong><span id="inf_mode">—</span></div>
+      <div class="kv"><strong>轮次</strong><span id="inf_round">—</span></div>
+      <div class="kv"><strong>轮询间隔</strong><span id="inf_interval">—</span></div>
+      <div class="kv"><strong>窗口累计</strong><span id="inf_windows">—</span></div>
+      <div class="legend" id="legend"></div>
+    </div>
+
+    <div class="card">
+      <h2>SSE 实时事件 <span id="sseRoundLabel" class="muted"></span></h2>
+      <div id="events" class="events"></div>
+    </div>
+  </section>
+</main>
+
+<script>
+(() => {
+  const $ = (s,p=document)=>p.querySelector(s);
+  const statusEl = $("#status");
+  const eventsEl = $("#events");
+  const infoBar = $("#infoBar");
+  const infJob = $("#inf_job"), infMode = $("#inf_mode"), infRound = $("#inf_round"),
+        infInterval = $("#inf_interval"), infWindows = $("#inf_windows"), legend = $("#legend");
+  const sseRoundLabel = $("#sseRoundLabel");
+
+  // ======= 状态 =======  
+  let es = null;
+  let activeJobId = null;
+  let activeMode = null;         // security_single / security_polling / offline-vision / offline-audio
+  let pollingInterval = null;    // 当前显示用
+  let latestRound = -1;          // 轮次（0-based）
+  let totalWindows = 0;          // 全局窗口计数
+  let perStreamWindows = {};     // {stream_index: max(stream_segment_index+1)}
+  let aliasMap = {};             // {rtsp_url: alias}
+  let urlByStreamIndex = {};     // 渲染显示用 {stream_index: url}
+  let streamPanels = {};         // {stream_index: HTMLElement}
+
+  // 统一判断是否轮询模式：兼容 security_polling / security-polling
+  function isPollingMode(mode) {
+    if (!mode) return false;
+    const m = String(mode).toLowerCase().replace(/_/g, "-");
+    return m.includes("security-polling");
+  }
+
+  function setStatus(msg, ok=true){
+    statusEl.innerHTML = ok ? `<span class="ok">✅ ${msg}</span>` : `<span class="err">❌ ${msg}</span>`;
+  }
+
+  function renderInfoBar(){
+    if (!activeJobId) {
+      infoBar.style.display = "none";
+      if (sseRoundLabel) sseRoundLabel.textContent = "";
+      return;
+    }
+    infoBar.style.display = "";
+    infJob.textContent = activeJobId;
+    infMode.textContent = activeMode || "—";
+    infRound.textContent = (latestRound>=0) ? String(latestRound+1) : "—";
+    infInterval.textContent = (pollingInterval!=null) ? `${pollingInterval}s` : "—";
+    infWindows.textContent = String(totalWindows);
+
+    // 顶部轮次提示
+    if (sseRoundLabel) {
+      if (isPollingMode(activeMode) && latestRound >= 0) {
+        sseRoundLabel.textContent = `当前轮询轮次：第 ${latestRound+1} 轮`;
+      } else {
+        sseRoundLabel.textContent = "";
+      }
+    }
+
+    legend.innerHTML = "";
+    const idxs = Object.keys(urlByStreamIndex).map(x=>Number(x)).sort((a,b)=>a-b);
+    idxs.forEach(i=>{
+      const url = urlByStreamIndex[i];
+      const alias = aliasMap[url] || url;
+      const w = perStreamWindows[i] || 0;
+      const div = document.createElement("div");
+      div.className = "kv";
+      div.innerHTML = `<strong>S${i}</strong><span>${alias}</span><span class="muted">（总观察窗口 ${w}）</span>`;
+      legend.appendChild(div);
+    });
+  }
+
+  function clearRuntimeCounters(){
+    latestRound = -1;
+    totalWindows = 0;
+    perStreamWindows = {};
+    urlByStreamIndex = {};
+    renderInfoBar();
+  }
+
+  function clearEvents(){
+    eventsEl.innerHTML = "";
+    streamPanels = {};
+  }
+
+  // ======= SSE =======  
+  function closeSSE(){ if (es) { es.close(); es=null; } }
+
+  function connectSSE(jobId){
+    closeSSE();
+    if (!jobId) return;
+    es = new EventSource(`/events?job_id=${encodeURIComponent(jobId)}`);
+    es.onmessage = (e)=>{
+      let data; try { data = JSON.parse(e.data); } catch { return; }
+      if (data.type === "vlm_done") {
+        const si   = Number(data.stream_index ?? NaN);
+        const round = Number(data.polling_round_index ?? NaN);
+        const sseg = Number(data.stream_segment_index ?? NaN);
+        const sUrl = String(data.stream_url ?? "");
+
+        if (!Number.isNaN(si)) {
+          urlByStreamIndex[si] = sUrl || (urlByStreamIndex[si] || "");
+        }
+        if (!Number.isNaN(si) && !Number.isNaN(sseg)) {
+          const val = sseg + 1;
+          perStreamWindows[si] = Math.max(perStreamWindows[si] || 0, val);
+        }
+        if (!Number.isNaN(round)) latestRound = Math.max(latestRound, round);
+
+        totalWindows += 1;
+        renderInfoBar();
+
+        addEventCard(data);
+      } else if (data.type === "asr_done") {
+        addEventCard(data);
+      }
+    };
+    es.onerror = ()=>setStatus("SSE 连接出错或中断", false);
+  }
+
+  // ======= 工具 =======  
+  const fmtSec = (x)=> (x!=null && isFinite(Number(x))) ? `${Number(x).toFixed(2)}s` : "—";
+  const levelMap = {
+    NO_RISK:  { txt: "无风险",   cls: "lvl-norisk" },
+    LOW:      { txt: "低风险",   cls: "lvl-low"  },
+    MEDIUM:   { txt: "中风险",   cls: "lvl-med"  },
+    HIGH:     { txt: "高风险",   cls: "lvl-high" },
+    CRITICAL: { txt: "严重",     cls: "lvl-crit" },
+  };
+  const pct = (v)=> {
+    const n = Number(v);
+    return isFinite(n) ? `${Math.round(Math.max(0, Math.min(1, n))*100)}%` : "—";
+  };
+  function pick(obj, ...keys){ for (const k of keys){ const v=obj?obj[k]:undefined; if(v!==undefined && v!==null) return v; } }
+
+  // 轮询模式下，根据 stream_index 找到/创建对应的面板容器
+  function getStreamPanelContainer(sse){
+    if (!isPollingMode(activeMode)) {
+      return eventsEl;
+    }
+    const rawIdx = sse.stream_index;
+    const idx = Number(rawIdx);
+    if (!Number.isFinite(idx)) return eventsEl;
+
+    let panel = streamPanels[idx];
+    if (!panel || !panel.isConnected) {
+      panel = document.createElement("div");
+      panel.className = "stream-panel";
+      panel.dataset.streamIndex = String(idx);
+
+      const header = document.createElement("div");
+      header.className = "stream-panel-header";
+
+      const title = document.createElement("div");
+      title.className = "stream-panel-title";
+      header.appendChild(title);
+
+      const stat = document.createElement("div");
+      stat.className = "stream-panel-stat";
+      stat.innerHTML = `
+        <span>总观察窗口：<span class="val-total">0</span></span>
+        <span>当前轮次观察窗口：<span class="val-round">0</span></span>
+      `;
+      header.appendChild(stat);
+
+      panel.appendChild(header);
+
+      const evWrap = document.createElement("div");
+      evWrap.className = "stream-panel-events";
+      panel.appendChild(evWrap);
+
+      // 按 stream_index 排序插入
+      const existing = [...eventsEl.querySelectorAll(".stream-panel")];
+      const before = existing.find(n => Number(n.dataset.streamIndex) > idx);
+      if (before) eventsEl.insertBefore(panel, before); else eventsEl.appendChild(panel);
+
+      streamPanels[idx] = panel;
+    }
+
+    const url = sse.stream_url || "";
+    const alias = aliasMap[url] || url || `S${idx}`;
+    const titleEl = panel.querySelector(".stream-panel-title");
+    if (titleEl) titleEl.textContent = `S${idx} · ${alias}`;
+
+    const totalEl = panel.querySelector(".val-total");
+    if (totalEl) totalEl.textContent = String(perStreamWindows[idx] || 0);
+
+    const winIdx = Number(sse.window_index_in_stream ?? NaN);
+    const roundEl = panel.querySelector(".val-round");
+    if (roundEl && Number.isFinite(winIdx)) {
+      roundEl.textContent = String(winIdx + 1);
+    }
+
+    return panel.querySelector(".stream-panel-events") || panel;
+  }
+
+  // ======= 事件卡片渲染 =======  
+  function addEventCard(sse){
+    const container = getStreamPanelContainer(sse);
+
+    const block = document.createElement("div");
+    block.className = "event-card";
+
+    const seg      = sse.segment_index ?? sse.seg ?? "—";
+    const round    = (sse.polling_round_index!=null) ? sse.polling_round_index : "—";
+    const sIdx     = (sse.stream_index!=null) ? sse.stream_index : "—";
+    const sSeg     = (sse.stream_segment_index!=null) ? sse.stream_segment_index : "—";
+    const winIdx   = (sse.window_index_in_stream!=null) ? sse.window_index_in_stream : "—";
+    const t0       = pick(sse,"t0","clip_t0");
+    const t1       = pick(sse,"t1","clip_t1");
+    const url      = sse.stream_url || "";
+    const alias    = aliasMap[url] || url || (sIdx!=="—" ? `S${sIdx}` : "");
+
+    // 左列
+    const left = document.createElement("div");
+    const head = document.createElement("div");
+    head.className = "event-head";
+    const badgeTxt = (sse.type === "asr_done") ? "ASR ✓" : "VLM ✓";
+    head.innerHTML = `<span class="badge">${badgeTxt}</span><span class="seg">seg#${seg}</span>`;
+    const meta = document.createElement("div");
+    meta.className = "event-meta";
+    const parts = [];
+    parts.push(`window [${fmtSec(t0)} ~ ${fmtSec(t1)}]`);
+    if (isPollingMode(activeMode)) {
+      parts.push(`S${sIdx} · ${alias}`);
+      if (sSeg !== "—")   parts.push(`总观察窗口 #${Number(sSeg)+1}`);
+      if (winIdx !== "—") parts.push(`当前轮次窗口 #${Number(winIdx)+1}`);
+      if (round !== "—")  parts.push(`轮询轮次 #${Number(round)+1}`);
+    }
+    meta.innerHTML = parts.map(x=>`<span>${x}</span>`).join("");
+    head.appendChild(meta);
+    left.appendChild(head);
+
+    // 内容：结构化数组或纯文本
+    const fullText = (sse.text ?? sse.full_text ?? "").trim();
+    let arr = [];
+    try { const tmp = JSON.parse(fullText); if (Array.isArray(tmp)) arr = tmp; } catch {}
+    if (arr.length===0) {
+      const row = document.createElement("div");
+      row.className = "event-desc";
+      row.textContent = fullText || "（无新增）";
+      left.appendChild(row);
+    } else {
+      arr.forEach(it=>{
+        const level = String(it.level||"").toUpperCase();
+        const lv = levelMap[level] || levelMap.MEDIUM;
+        const row = document.createElement("div");
+        row.className = "event-desc";
+        row.innerHTML = `${it.describe || "检测到事件"} <span class="badge-lvl ${lv.cls}">${lv.txt}</span> <span class="muted">置信度 ${pct(it.confidence)}</span>`;
+        left.appendChild(row);
+        if (it.suggestion) {
+          const sug = document.createElement("div");
+          sug.className = "event-sugg";
+          sug.textContent = `建议：${it.suggestion}`;
+          left.appendChild(sug);
+        }
+      });
+    }
+
+    // 右列证据
+    const right = document.createElement("div");
+    right.className = "evidence-wrap";
+    const urls = (Array.isArray(sse.evidence_image_urls)&&sse.evidence_image_urls) || [];
+    if (urls.length===0) {
+      right.innerHTML = `<div class="muted" style="font-size:12px;text-align:center;">无证据帧</div>`;
+    } else {
+      const grid = document.createElement("div");
+      grid.className = "evidence-grid";
+      urls.forEach(u=>{
+        const it = document.createElement("div");
+        it.className="evidence-item";
+        it.innerHTML = `<a href="${u}" target="_blank" rel="noopener"><img src="${u}" alt="evidence"></a>`;
+        grid.appendChild(it);
+      });
+      right.appendChild(grid);
+    }
+
+    block.appendChild(left);
+    block.appendChild(right);
+    container.appendChild(block);
+
+    // 滚到底
+    eventsEl.scrollTop = eventsEl.scrollHeight;
+  }
+
+  // ======= Jobs =======  
+  const jobsSelect = $("#jobsSelect");
+  async function refreshJobs(selKeep=true){
+    try{
+      const r = await fetch("/jobs");
+      const j = await r.json();
+      if (!r.ok || !j.ok) throw new Error(j.error || "获取 jobs 失败");
+      const prev = jobsSelect.value;
+      jobsSelect.innerHTML = "";
+      (j.jobs||[]).forEach(item=>{
+        const opt = document.createElement("option");
+        opt.value = item.job_id;
+        opt.textContent = `${item.job_id} (${item.mode}${item.running?"/running":"/stopped"})`;
+        opt.dataset.mode = item.mode;
+        jobsSelect.appendChild(opt);
+      });
+      if (selKeep && prev && [...jobsSelect.options].some(o=>o.value===prev)) {
+        jobsSelect.value = prev;
+      } else if (jobsSelect.options.length>0) {
+        jobsSelect.selectedIndex = 0;
+      }
+      onSelectJobChanged();
+    }catch(e){ setStatus(e.message||"刷新失败", false); }
+  }
+  function onSelectJobChanged(){
+    const opt = jobsSelect.options[jobsSelect.selectedIndex];
+    activeJobId = opt ? opt.value : null;
+    activeMode  = opt ? (opt.dataset.mode || "—") : null;
+    clearRuntimeCounters();
+    clearEvents();
+    connectSSE(activeJobId);
+    if (!isPollingMode(activeMode)) {
+      pollingInterval = null;
+    }
+    renderInfoBar();
+  }
+  $("#btnRefreshJobs").addEventListener("click", ()=>refreshJobs(false));
+  jobsSelect.addEventListener("change", onSelectJobChanged);
+
+  // ======= 工具函数 =======  
+  function clampNumber(v, def, min, max){
+    let n = Number(v);
+    if (!Number.isFinite(n)) n = def;
+    if (min!=null) n = Math.max(min, n);
+    if (max!=null) n = Math.min(max, n);
+    return n;
+  }
+  function detectMediaKindByName(name){
+    const ext = String(name||"").split(".").pop().toLowerCase();
+    const vids = ["mp4","avi","mkv","mov","flv"];
+    const auds = ["mp3","wav","aac","flac","ogg"];
+    return { isVideo: vids.includes(ext), isAudio: auds.includes(ext) };
+  }
+  function lockTopK(inputEl, isLocal){
+    if (!inputEl) return;
+    if (isLocal) {
+      if (!inputEl.dataset.prev) inputEl.dataset.prev = inputEl.value || "1";
+      inputEl.value = "1"; inputEl.min="1"; inputEl.max="1"; inputEl.step="1";
+      inputEl.disabled=true; inputEl.title="本地模型固定 TopK=1";
+    } else {
+      inputEl.disabled=false; inputEl.min="1"; inputEl.max="8"; inputEl.step="1"; inputEl.title="";
+      const prev = inputEl.dataset.prev;
+      if (prev && prev !== "1") inputEl.value = prev;
+    }
+  }
+
+  // ======= 单流启动 =======  
+  $("#single_backend").addEventListener("change", (e)=>{
+    const v = e.target.value;
+    $("#rowSingleLocal").style.display = (v==="local")?"":"none";
+    $("#rowSingleCloud").style.display = (v==="cloud")?"":"none";
+    lockTopK($("#single_topk"), v==="local");
+  });
+
+  $("#formSingle").addEventListener("submit", async (ev)=>{
+    ev.preventDefault();
+    const backend = $("#single_backend").value;
+
+    // 数值钳制
+    const cutwin = clampNumber($("#single_cutwin").value, 4.0, 1, null);
+    const alpha  = clampNumber($("#single_alpha").value, 0.5, 0, 1);
+    const topk   = clampNumber($("#single_topk").value, 1, 1, null);
+
+    const fd = new FormData();
+    fd.append("rtsp_url", $("#single_rtsp").value.trim());
+    fd.append("vlm_backend", backend);
+    if (backend==="local") fd.append("local_model_name", $("#single_local_model").value);
+    if (backend==="cloud") fd.append("cloud_model_name", $("#single_cloud_model").value);
+
+    // 优先自定义，否则用预设
+    const custom = $("#single_prompt").value.trim();
+    if (custom) fd.append("rtsp_system_prompt", custom);
+    fd.append("vlm_preset", $("#single_preset").value);
+
+    fd.append("cut_window_sec", String(cutwin));
+    fd.append("alpha_bgr",     String(alpha));
+    fd.append("topk_frames",   String(topk));
+
+    fd.append("vlm_event_min_level", $("#single_minlvl").value || "LOW");
+    fd.append("rtsp_cut_number", $("#single_cutnum").value || "1");
+
+    setStatus("启动 single…");
+    try{
+      const r = await fetch("/security/single_start",{method:"POST", body:fd});
+      const j = await r.json();
+      if(!r.ok || !j.ok) throw new Error(j.error || "启动失败");
+
+      // 绑定别名
+      const url = $("#single_rtsp").value.trim();
+      const alias = $("#single_alias").value.trim();
+      if (url && alias) aliasMap[url] = alias;
+
+      await refreshJobs(false);
+      $("#jobsSelect").value = j.job_id;
+      onSelectJobChanged();
+      setStatus(`single 启动成功，job=${j.job_id}`);
+    }catch(e){ setStatus(e.message||"请求失败", false); }
+  });
+
+  // ======= 轮询启动 =======  
+  const pollingList = $("#pollingList");
+  function makeRow(idx){
+    const wrap = document.createElement("div");
+    wrap.className="card";
+    wrap.style.padding="8px";
+    wrap.innerHTML = `
+      <div class="row"><label>RTSP #${idx+1}</label><input type="text" class="pl_url" placeholder="rtsp://..." required></div>
+      <div class="grid3">
+        <input type="text" class="pl_alias" placeholder="别名(前端)">
+        <select class="pl_preset">
+          <option value="">(可选) 预设</option>
+          <option value="FACTORY_SECURITY">工厂安防</option>
+          <option value="RESIDENTIAL_SECURITY">小区安防</option>
+          <option value="OFFICE_PRODUCTIVITY_COMPLIANT">办公区秩序与占用</option>
+          <option value="CONSTRUCTION_PPE">施工现场 PPE 与三违</option>
+          <option value="RETAIL_LOSS_PREVENTION">零售门店 防损与陈列合规</option>
+          <option value="TRAFFIC_INTERSECTION">交通路口 态势与风险</option>
+          <option value="WAREHOUSE_SAFETY">仓储作业 安全与效率</option>
+          <option value="LAB_DATACENTER_SAFETY">实验室与机房 安全合规</option>
+          <option value="MANUFACTURING_QA">生产线 外观质检与工位异常</option>
+          <option value="HEALTHCARE_PUBLIC_SAFETY">医疗养老机构 公共安全</option>
+        </select>
+        <input type="text" class="pl_prompt" placeholder="(可选) 自定义提示词">
+      </div>
+      <div class="row"><label>每轮切片数</label><input type="number" class="pl_cutnum" min="1" max="10" value="1" title="每轮切片数"></div>
+    `;
+    return wrap;
+  }
+  function reindexRows(){
+    [...pollingList.children].forEach((node,i)=>{
+      const lab = node.querySelector("label");
+      if (lab) lab.textContent = `RTSP #${i+1}`;
+    });
+  }
+  function addRow(){ pollingList.appendChild(makeRow(pollingList.children.length)); reindexRows(); }
+  $("#btnAddRow").addEventListener("click", addRow);
+  $("#btnDelLast").addEventListener("click", ()=>{ if (pollingList.lastChild) pollingList.removeChild(pollingList.lastChild); reindexRows(); });
+  $("#btnClearAll").addEventListener("click", ()=>{ pollingList.innerHTML=""; });
+
+  $("#poll_backend").addEventListener("change", (e)=>{
+    const v = e.target.value;
+    $("#rowPollLocal").style.display = (v==="local")?"":"none";
+    $("#rowPollCloud").style.display = (v==="cloud")?"":"none";
+    lockTopK($("#poll_topk"), v==="local");
+  });
+
+  $("#formPolling").addEventListener("submit", async (ev)=>{
+    ev.preventDefault();
+    const rows = [...pollingList.children];
+    if (rows.length<2) { setStatus("轮询至少需要2路", false); return; }
+    const backend = $("#poll_backend").value;
+
+    // 数值钳制
+    const cutwin = clampNumber($("#poll_cutwin").value, 4.0, 1, null);
+    const alpha  = clampNumber($("#poll_alpha").value, 0.5, 0, 1);
+    const topk   = clampNumber($("#poll_topk").value, 1, 1, null);
+
+    // 汇总 streams + 别名缓存
+    const streams = [];
+    rows.forEach(row=>{
+      const url = row.querySelector(".pl_url").value.trim();
+      const alias = row.querySelector(".pl_alias").value.trim();
+      const preset = row.querySelector(".pl_preset").value;
+      const custom = row.querySelector(".pl_prompt").value.trim();
+      const cutnum = Number(row.querySelector(".pl_cutnum").value || 1);
+      if (url) {
+        const prompt = custom || preset || null; // 每路只传一个字段：rtsp_system_prompt
+        streams.push({ rtsp_url: url, rtsp_system_prompt: prompt, rtsp_cut_number: Math.max(1, Math.min(10, cutnum)) });
+        if (alias) aliasMap[url] = alias;
+      }
+    });
+
+    const body = {
+      vlm_backend: backend,
+      local_model_name: backend==="local" ? $("#poll_local_model").value : null,
+      cloud_model_name: backend==="cloud" ? $("#poll_cloud_model").value : null,
+      cut_window_sec: cutwin,
+      alpha_bgr: alpha,
+      topk_frames: topk,
+      vlm_event_min_level: $("#poll_minlvl").value || "LOW",
+      polling_batch_interval: Number($("#poll_interval").value || 15),
+      streams
+    };
+
+    setStatus("启动 polling…");
+    try{
+      const r = await fetch("/security/polling_start",{method:"POST", headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+      const j = await r.json();
+      if(!r.ok || !j.ok) throw new Error(j.error || "启动失败");
+      pollingInterval = body.polling_batch_interval;
+      await refreshJobs(false);
+      $("#jobsSelect").value = j.job_id;
+      onSelectJobChanged();
+      setStatus(`polling 启动成功，job=${j.job_id}`);
+    }catch(e){ setStatus(e.message||"请求失败", false); }
+  });
+
+  // ======= 离线：视频/音频 =======  
+  $("#off_backend").addEventListener("change",(e)=>{
+    const v=e.target.value;
+    $("#rowOffLocal").style.display = (v==="local")?"":"none";
+    $("#rowOffCloud").style.display = (v==="cloud")?"":"none";
+  });
+
+  $("#formOffline").addEventListener("submit", async (ev)=>{
+    ev.preventDefault();
+    const fd = new FormData();
+    const f = $("#off_file").files[0];
+    const path = $("#off_path").value.trim();
+    if (f) fd.append("file", f);
+    if (!f && path) fd.append("file_path", path);
+    if (!f && !path) { setStatus("请选择文件或填写本地路径", false); return; }
+
+    // 数值钳制
+    const cutwin = clampNumber($("#off_cutwin").value, 6.0, 1, null);
+    const alpha  = clampNumber($("#off_alpha").value, 0.5, 0, 1);
+    const topk   = clampNumber($("#off_topk").value, 3, 1, null);
+    fd.append("cut_window_sec", String(cutwin));
+    fd.append("alpha_bgr",     String(alpha));
+    fd.append("topk_frames",   String(topk));
+
+    const name = f ? f.name : path;
+    const {isVideo,isAudio} = detectMediaKindByName(name);
+
+    if (isVideo) {
+      fd.append("system_prompt", $("#off_sys_prompt").value || "");
+      const backend = $("#off_backend").value;
+      fd.append("vlm_backend", backend);
+      if (backend==="local") fd.append("local_model_name", $("#off_local_model").value);
+      if (backend==="cloud") fd.append("cloud_model_name", $("#off_cloud_model").value);
+    } else {
+      // 音频：VLM项对后端无意义，但字段存在也不影响
+      fd.append("vlm_backend", "local");
+    }
+
+    setStatus("启动离线任务…");
+    try{
+      const r = await fetch("/offline/vision_describe_start",{method:"POST", body:fd});
+      const j = await r.json();
+      if(!r.ok || !j.ok) throw new Error(j.error || "启动失败");
+      await refreshJobs(false);
+      $("#jobsSelect").value = j.job_id;
+      onSelectJobChanged();
+      setStatus(`离线任务已启动（${j.mode}），job=${j.job_id}`);
+    }catch(e){ setStatus(e.message||"请求失败", false); }
+  });
+
+  // ======= 运行期控制 =======  
+  $("#btnPause").addEventListener("click", async ()=>{
+    if (!activeJobId) return setStatus("请选择 Job", false);
+    const r = await fetch(`/security/${encodeURIComponent(activeJobId)}/pause`,{method:"POST"});
+    const j = await r.json(); if(!r.ok||!j.ok) return setStatus(j.error||"暂停失败", false);
+    setStatus(`已暂停 job=${activeJobId}`);
+  });
+  $("#btnResume").addEventListener("click", async ()=>{
+    if (!activeJobId) return setStatus("请选择 Job", false);
+    const r = await fetch(`/security/${encodeURIComponent(activeJobId)}/resume`,{method:"POST"});
+    const j = await r.json(); if(!r.ok||!j.ok) return setStatus(j.error||"恢复失败", false);
+    setStatus(`已恢复 job=${activeJobId}`);
+  });
+  $("#btnStopJob").addEventListener("click", async ()=>{
+    if (!activeJobId) return setStatus("请选择 Job", false);
+    const r = await fetch(`/job/${encodeURIComponent(activeJobId)}/stop`,{method:"POST"});
+    const j = await r.json(); if(!r.ok||!j.ok) return setStatus(j.error||"停止失败", false);
+    setStatus(`已停止 job=${activeJobId}`); closeSSE(); await refreshJobs(false);
+  });
+
+  // 轮询专用：改间隔、新增/删除/更新流  
+  $("#btnSetInterval").addEventListener("click", async ()=>{
+    if (!activeJobId) return setStatus("请选择 Job", false);
+    if (!isPollingMode(activeMode)) return setStatus("当前非轮询模式", false);
+    const v = clampNumber($("#ctl_interval").value, 15, 10, null);
+    const fd = new FormData(); fd.append("polling_batch_interval", String(v));
+    const r = await fetch(`/security/${encodeURIComponent(activeJobId)}/polling/update_interval`,{method:"POST", body:fd});
+    const j = await r.json(); if(!r.ok||!j.ok) return setStatus(j.error||"设置失败", false);
+    pollingInterval = v; renderInfoBar();
+    setStatus(`已设置轮询间隔=${v}s`);
+  });
+
+  $("#btnAddStream").addEventListener("click", async ()=>{
+    if (!activeJobId) return setStatus("请选择 Job", false);
+    if (!isPollingMode(activeMode)) return setStatus("当前非轮询模式", false);
+    const url = $("#ctl_add_url").value.trim();
+    if (!url) return setStatus("请输入URL", false);
+    const alias = $("#ctl_add_alias").value.trim();
+    const body = {
+      rtsp_url: url,
+      rtsp_system_prompt: $("#ctl_add_prompt").value.trim() || null,
+      rtsp_cut_number: Number($("#ctl_add_cutnum").value || 1)
+    };
+    const r = await fetch(`/security/${encodeURIComponent(activeJobId)}/polling/add_stream`,{
+      method:"POST", headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)
+    });
+    const j = await r.json(); if(!r.ok||!j.ok) return setStatus(j.error||"新增失败", false);
+    if (alias) aliasMap[url] = alias;
+    setStatus(`已新增流，当前共 ${j.count} 路`);
+  });
+
+  $("#btnDelStream").addEventListener("click", async ()=>{
+    if (!activeJobId) return setStatus("请选择 Job", false);
+    if (!isPollingMode(activeMode)) return setStatus("当前非轮询模式", false);
+    const url = $("#ctl_del_url").value.trim();
+    if (!url) return setStatus("请输入URL", false);
+    const fd = new FormData(); fd.append("rtsp_url", url);
+    const r = await fetch(`/security/${encodeURIComponent(activeJobId)}/polling/remove_stream`,{method:"POST", body:fd});
+    const j = await r.json(); if(!r.ok||!j.ok) return setStatus(j.error||"删除失败", false);
+    delete aliasMap[url];
+    setStatus(`已删除，当前共 ${j.count} 路`);
+  });
+
+  $("#btnUpdStream").addEventListener("click", async ()=>{
+    if (!activeJobId) return setStatus("请选择 Job", false);
+    const body = {
+      old_rtsp_url: $("#ctl_upd_old").value.trim() || null,
+      index: ($("#ctl_upd_idx").value==="" ? null : Number($("#ctl_upd_idx").value)),
+      item: {
+        rtsp_url: $("#ctl_upd_newurl").value.trim(),
+        rtsp_system_prompt: $("#ctl_upd_prompt").value.trim() || null,
+        rtsp_cut_number: ($("#ctl_upd_cutnum").value==="" ? 1 : Number($("#ctl_upd_cutnum").value))
+      }
+    };
+    if (!body.item.rtsp_url) return setStatus("新URL不能为空", false);
+    const alias = $("#ctl_upd_alias").value.trim();
+    const r = await fetch(`/security/${encodeURIComponent(activeJobId)}/update_stream`,{
+      method:"POST", headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)
+    });
+    const j = await r.json(); if(!r.ok||!j.ok) return setStatus(j.error||"更新失败", false);
+    if (alias) aliasMap[body.item.rtsp_url] = alias;
+    if (j.old) delete aliasMap[j.old];
+    setStatus(`已更新流：${(j.index!=null)?`index=${j.index}`:"单流"} → ${j.new}`);
+  });
+
+  // 统计 / 全停  
+  $("#btnStats").addEventListener("click", async ()=>{
+    if (!activeJobId) return setStatus("请选择 Job", false);
+    const r = await fetch(`/job/${encodeURIComponent(activeJobId)}/stats`);
+    const j = await r.json(); if(!r.ok||!j.ok) return setStatus(j.error||"获取统计失败", false);
+    setStatus(`统计：${JSON.stringify(j.stats)}`);
+  });
+  $("#btnResetStats").addEventListener("click", async ()=>{
+    if (!activeJobId) return setStatus("请选择 Job", false);
+    const r = await fetch(`/job/${encodeURIComponent(activeJobId)}/stats/reset`,{method:"POST"});
+    const j = await r.json(); if(!r.ok||!j.ok) return setStatus(j.error||"重置失败", false);
+    setStatus("已重置统计");
+  });
+  $("#btnStopAll").addEventListener("click", async ()=>{
+    const r = await fetch("/stop",{method:"POST"}); const j = await r.json();
+    if (!r.ok || !j.ok) return setStatus(j.error||"全停失败", false);
+    setStatus("已停止全部任务"); closeSSE(); refreshJobs(false); clearRuntimeCounters(); clearEvents();
+  });
+
+  // 初始：默认两行轮询输入  
+  (function init(){
+    addRow(); addRow();
+    refreshJobs(false);
+    // 初始化 topk 锁定
+    lockTopK($("#single_topk"), true);   // 默认本地
+    lockTopK($("#poll_topk"), true);
+    lockTopK($("#off_topk"), true);
+  })();
+})();
+</script>
+</body>
+</html>

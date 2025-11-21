@@ -206,3 +206,28 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
+# Python
+__pycache__/
+*.pyc
+
+# 虚拟环境
+.venv/
+env/
+venv/
+
+# 本地配置
+.env
+
+# 日志和运行时
+logs/
+run/
+*.log
+
+# 临时输出/结果
+out/
+
+# IDE
+.vscode/
+.idea/
+*.iml
+

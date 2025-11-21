@@ -1,554 +1,73 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-"""
-子线程A：切窗 + 标准化 + （按模式）关键帧策略（含 OpenCV/FFmpeg 双兜底）
-- 固定参数：url / have_audio_track / mode / slice_sec（启动时传入）
-- 运行期控制：q_ctrl 收到 {type: ...}
-    START / PAUSE / RESUME / MODE_CHANGE / UPDATE_SLICE / UPDATE_OVERLAP / STOP
-- 输出（发往下游 B/C 的“数据”队列，A 不负责下游 STOP 哨兵）：
-    (若启用B且存在视频)
-    q_video.put({
-        "path": <无声小视频>, "t0": <秒>, "t1": <秒>,
-        "clip_t0": <秒>, "clip_t1": <秒>,
-        "segment_index": <int>,
-        "mode": "offline|online|security",
-        "win": <float>, "step": <float>, "overlap_sec": <float>,
-        "has_audio": <bool>,
-        "keyframes": [<jpg路径>...],            # 关键帧/快照（若策略选择了图像）
-        "frame_pts": [<float秒>...],            # 与 keyframes 一一对应（源时间线）
-        "frame_indices": [<int>...],            # 可选：帧索引（相对该片段 v_out）
-        "keyframe_count": <int>,
-        "small_video": <压缩后mp4路径或 None>,
-        "small_video_fps": <float或None>,       # 若走小视频策略则提供
-        "hires": <bool>,
-        "policy": {
-            "significant_motion": <bool>,
-            "policy_used": "small_video" | "fixed_sampling" | "keyframes" | "none",
-            "interval_sec": <float>,
-            "max_frames": <int|None>,
-            "silence_hint": {"silence_ratio": <float>, "is_mostly_silent": <bool>}
-        }
-    })
-    (若启用C且存在音频)
-    q_audio.put({
-        "path": <标准化wav>, "t0": <秒>, "t1": <秒>,
-        "segment_index": <int>,
-        "silence_hint": {"silence_ratio": <float>, "is_mostly_silent": <bool>}
-    })
-"""
-
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List, Dict, Any, Callable
 from queue import Queue, Empty, Full
-from time import sleep
-import subprocess
+from time import sleep, time as now_ts
+from datetime import datetime, timezone
 import numpy as np
 import cv2
-import time
 import os
 
 from src.all_enum import MODEL
-from src.utils.ffmpeg_utils import FFmpegUtils
+from src.configs.rtsp_batch_config import RTSPBatchConfig, RTSP
+from src.configs.cut_config import CutConfig
 from src.utils.logger_utils import get_logger
+
+from src.utils.ffmpeg.python_ffmpeg_utils import (
+    probe_duration_seconds,
+    cut_and_standardize_segment,
+    grab_frame_by_index,
+)
+
+from src.utils.opencv.python_opencv_utils import (
+    imwrite_jpg,
+    get_video_meta,
+    resize_keep_w,
+    ssim_gray,
+    bgr_ratio_score,
+)
 
 logger = get_logger(__name__)
 
-
-# -------------------- 小工具 --------------------
-def _clamp(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, v))
-
-
-def _imwrite_jpg(path: str, img, quality: int = 90) -> str:
-    """imencode 写盘，避免中文路径问题。"""
-    ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
-    if not ok:
-        raise RuntimeError("cv2.imencode('.jpg', ...) failed")
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "wb") as f:
-        f.write(buf.tobytes())
-    return path
+RESIZE_W     = 320
+EXPECT_CANDS = 16
+OUT_DIR      = "static/out"
 
 
-def _get_video_meta(video_path: str) -> Tuple[float, int]:
-    """返回 (fps, total_frames)；失败时回退 (25.0, 0)"""
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        return 25.0, 0
-    try:
-        fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    finally:
-        cap.release()
-    if fps <= 0:
-        fps = 25.0
-    return fps, total
-
-
+# ===================== 小工具 =====================
 def _file_exists_nonzero(path: Optional[str]) -> bool:
     return bool(path) and os.path.exists(path) and os.path.getsize(path) > 0
 
 
-# -------------------- 窗口/步长策略 --------------------
-def _mode_window_policy(mode: MODEL, desire_win: float, overlap_sec: float) -> Tuple[float, float]:
-    """
-    返回 (win, step)
-    - security: win ∈ [4, 8],   step = win
-    - online  : win ∈ [5, 10],  step = win
-    - offline : win ∈ [8, 15],  step = win - overlap_sec (overlap ∈ [0.0, 1.0])
-    """
-    if mode == MODEL.SECURITY:
-        win = _clamp(float(desire_win), 4.0, 12.0)  # 建议 4~8
-        return win, win
-    elif mode == MODEL.ONLINE:
-        win = _clamp(float(desire_win), 5.0, 16.0)  # 建议 5~10
-        return win, win
-    else:
-        win = _clamp(float(desire_win), 8.0, 30.0)  # 建议 8~15
-        ovl = _clamp(float(overlap_sec), 0.0, 2.0)
-        step = max(0.1, win - ovl)
-        return win, step
-
-
-# -------------------- 运动评分（探测，不写盘） --------------------
-def compute_motion_score(
-    video_path: str,
-    sample_interval: float = 1.0,
-    resize_w: int = 160,
-    max_samples: int = 30,
-) -> dict:
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        return {"avg_diff": 0.0, "max_diff": 0.0, "samples": 0}
-
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    step = max(1, int(round(fps * sample_interval)))
-    last_gray = None
-    diffs: List[float] = []
+def _epoch_to_iso_utc(ts_epoch: float) -> str:
     try:
-        i = 0
-        while len(diffs) < max_samples:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            i += 1
-            if i % step:
-                continue
-            h, w = frame.shape[:2]
-            small_h = max(1, int(h * (resize_w / max(1, w))))
-            small = cv2.resize(frame, (resize_w, small_h), interpolation=cv2.INTER_AREA)
-            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-            if last_gray is not None:
-                diffs.append(cv2.absdiff(last_gray, gray).mean())
-            last_gray = gray
-    finally:
-        cap.release()
-
-    if not diffs:
-        return {"avg_diff": 0.0, "max_diff": 0.0, "samples": 0}
-    return {"avg_diff": float(sum(diffs) / len(diffs)), "max_diff": float(max(diffs)), "samples": len(diffs)}
-
-
-def fast_motion_detect_placeholder(
-    video_path: str,
-    sample_interval: float = 1.0,
-    diff_threshold: float = 15.0,
-    max_samples: int = 30,
-) -> bool:
-    score = compute_motion_score(video_path, sample_interval, 160, max_samples)
-    return score["samples"] > 0 and score["avg_diff"] >= diff_threshold
-
-
-# -------------------- 静音探测（基于标准化后的音频 a_out） --------------------
-def silence_detect_hint(
-    audio_path: str,
-    *,
-    noise_db: float = -40.0,
-    min_silence: float = 0.30,
-    timeout_sec: float = 60.0,
-) -> dict:
-    """
-    使用 FFmpeg silencedetect 对标准化后的 WAV（16kHz/mono/PCM16）做静音探测。
-    返回：{"silence_ratio": <0~1>, "is_mostly_silent": <bool>, "segments": [(s,e)...]}
-    """
-    import re, subprocess
-    try:
-        duration = FFmpegUtils.ffprobe_duration(audio_path)
+        return datetime.fromtimestamp(float(ts_epoch), tz=timezone.utc) \
+                       .isoformat(timespec="seconds") \
+                       .replace("+00:00", "Z")
     except Exception:
-        duration = None
-
-    start_re = re.compile(r"silence_start:\s*([0-9.]+)")
-    end_re = re.compile(r"silence_end:\s*([0-9.]+)\s*\|\s*silence_duration:\s*([0-9.]+)")
-
-    cmd = [
-        "ffmpeg", "-hide_banner", "-nostats", "-v", "info",
-        "-i", audio_path,
-        "-af", f"silencedetect=noise={noise_db}dB:d={min_silence}",
-        "-f", "null", "-"
-    ]
-
-    try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, bufsize=1)
-    except FileNotFoundError:
-        return {"silence_ratio": 0.0, "is_mostly_silent": False, "segments": []}
-
-    silence_intervals: List[tuple] = []
-    cur_start = None
-    t0 = time.time()
-    try:
-        assert proc.stderr
-        for line in iter(proc.stderr.readline, ""):
-            if timeout_sec and (time.time() - t0 > timeout_sec):
-                break
-            m1 = start_re.search(line)
-            if m1:
-                try:
-                    cur_start = float(m1.group(1))
-                except Exception:
-                    cur_start = None
-                continue
-            m2 = end_re.search(line)
-            if m2:
-                try:
-                    end = float(m2.group(1))
-                    dur = float(m2.group(2))
-                    silence_intervals.append((cur_start, end, dur))
-                except Exception:
-                    pass
-                cur_start = None
-        try:
-            proc.terminate()
-        except Exception:
-            pass
-        try:
-            proc.wait(timeout=2)
-        except Exception:
-            pass
-    except Exception:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-
-    total_silence = sum([d for _, _, d in silence_intervals if d])
-    if duration and duration > 0:
-        silence_ratio = max(0.0, min(1.0, total_silence / duration))
-    else:
-        silence_ratio = 0.0
-
-    return {
-        "silence_ratio": round(silence_ratio, 3),
-        "is_mostly_silent": silence_ratio > 0.8,
-        "segments": [(s, e) for (s, e, _) in silence_intervals if s is not None and e is not None],
-    }
-
-
-# -------------------- FFmpeg 抓帧兜底 --------------------
-def _ffmpeg_grab_frames_by_indices(video_path: str, out_dir: str, tag: str, indices: List[int]) -> List[str]:
-    """
-    按近似帧位导出图片（用 eq(n,idx) 选择），部分容器/时间基可能不精确。
-    """
-    if not indices:
-        return []
-    os.makedirs(out_dir, exist_ok=True)
-    outs: List[str] = []
-    for k, idx in enumerate(indices):
-        out = os.path.join(out_dir, f"{tag}_snap_{k:04d}.jpg")
-        # 注意：某些封装下 eq(n,idx) 并不总能命中；这是兜底手段
-        # -vsync vfr 可避免重复帧写出异常
-        cmd = [
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-i", video_path,
-            "-vf", f"select='eq(n\\,{idx})'",
-            "-vsync", "vfr",
-            out
-        ]
-        try:
-            subprocess.check_call(cmd)
-            if _file_exists_nonzero(out):
-                outs.append(out)
-        except Exception:
-            # 如果按索引失败，就跳过这张，整体不报错
-            continue
-    return outs
-
-
-def _ffmpeg_grab_frames_by_interval(video_path: str, out_dir: str, tag: str, interval_sec: float) -> List[str]:
-    """
-    等间隔抓帧（fps=1/interval）。作为 OpenCV 间隔抽帧失败时的兜底。
-    """
-    if interval_sec <= 0:
-        interval_sec = 1.0
-    os.makedirs(out_dir, exist_ok=True)
-    pattern = os.path.join(out_dir, f"{tag}_kf_%04d.jpg")
-    cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-i", video_path,
-        "-vf", f"fps=1/{max(1e-3, float(interval_sec))}",
-        pattern
-    ]
-    try:
-        subprocess.check_call(cmd)
-    except Exception:
-        return []
-    # 收集写出的文件
-    outs = []
-    for fname in sorted(os.listdir(out_dir)):
-        if fname.startswith(f"{tag}_kf_") and fname.endswith(".jpg"):
-            outs.append(os.path.join(out_dir, fname))
-    return outs
-
-
-# -------------------- 关键帧/快照（含 PTS） --------------------
-def extract_keyframes_by_interval_with_pts(
-    video_path: str,
-    out_dir: str,
-    tag: str,
-    interval_sec: float = 1.0,
-    diff_threshold: float = 0.65,
-    resize_w: int = 320,
-    jpg_quality: int = 90,
-    max_frames: Optional[int] = None,
-    *,
-    seg_t0: float,
-) -> Tuple[List[str], List[float], List[int]]:
-    """
-    返回 (paths, pts_list, frame_indices)
-    - 优先 OpenCV：按间隔取帧并用相邻差分筛选
-    - OpenCV 打不开 → FFmpeg 兜底（等间隔导出）
-    """
-    # OpenCV 路线
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        logger.warning("[A] 待抽取关键帧视频，无法通过 OpenCV 打开，使用 FFmpeg 兜底")
-        # FFmpeg 兜底
-        outs = _ffmpeg_grab_frames_by_interval(video_path, out_dir, tag, interval_sec)
-        if not outs:
-            return [], [], []
-        # 没有明确的 pts/索引信息，这里用近似：按照顺序回填
-        fps, total = _get_video_meta(video_path)
-        if fps <= 0:
-            fps = 25.0
-        pts = [float(seg_t0) + i * interval_sec for i in range(len(outs))]
-        idxs = [min(int(round(i * fps * interval_sec)), max(0, total - 1)) for i in range(len(outs))]
-        return outs, pts, idxs
-
-    fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
-    if fps <= 0:
-        fps = 25.0
-    step = max(1, int(round(fps * interval_sec)))
-
-    paths: List[str] = []
-    pts: List[float] = []
-    fidx: List[int] = []
-
-    last_small = None
-    cur_idx = -1
-    try:
-        while True:
-            # 跳过 step-1 帧，抓一帧参与相邻差分
-            for _ in range(step - 1):
-                if not cap.grab():
-                    # 结束
-                    cap.release()
-                    return paths, pts, fidx
-            ret, frame = cap.read()
-            if not ret:
-                break
-            cur_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1  # 当前帧索引
-            h, w = frame.shape[:2]
-            small_h = max(1, int(h * (resize_w / max(1, w))))
-            small = cv2.resize(frame, (resize_w, small_h), interpolation=cv2.INTER_AREA)
-
-            save = last_small is None
-            if last_small is not None:
-                diff = cv2.absdiff(last_small, small)
-                score = float(np.count_nonzero(diff)) / float(diff.size)
-                save = score >= diff_threshold
-            last_small = small
-
-            if save:
-                name = f"{tag}_kf_{len(paths):04d}.jpg"
-                out_path = os.path.join(out_dir, name)
-                _imwrite_jpg(out_path, frame, quality=jpg_quality)
-                paths.append(out_path)
-                pts.append(float(seg_t0) + (cur_idx / fps))
-                fidx.append(cur_idx)
-                if max_frames and len(paths) >= max_frames:
-                    break
-    finally:
-        cap.release()
-
-    return paths, pts, fidx
-
-
-def sample_fixed_frames_with_pts(
-    video_path: str,
-    out_dir: str,
-    tag: str,
-    count: int = 2,
-    jpg_quality: int = 90,
-    *,
-    seg_t0: float
-) -> Tuple[List[str], List[float], List[int]]:
-    """
-    更稳妥的固定抽帧：优先“顺播”读取，避免 set(CAP_PROP_POS_FRAMES) 的随机 seek 不可靠；
-    OpenCV 失败则使用 FFmpeg 按帧索引近似抓帧（或按时间等距抓帧）兜底。
-    返回 (paths, pts_list, frame_indices)
-    """
-    # ---- OpenCV 顺播 ----
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        logger.warning("[A] 待抽取固定帧视频，无法通过 OpenCV 打开，使用 FFmpeg 兜底")
-        # 用 meta 估算索引/时间点
-        fps, total = _get_video_meta(video_path)
-        if total <= 0:
-            return [], [], []
-        if count <= 1:
-            indices = [total // 2]
-        else:
-            indices = [int(round((k + 1) / (count + 1) * total)) for k in range(count)]
-        outs = _ffmpeg_grab_frames_by_indices(video_path, out_dir, tag, indices)
-        if not outs:
-            # 最后备选：按等间隔
-            outs = _ffmpeg_grab_frames_by_interval(video_path, out_dir, tag, max(1.0, (total / max(1, count)) / max(1.0, fps)))
-        if not outs:
-            return [], [], []
-        if fps <= 0:
-            fps = 25.0
-        pts = [float(seg_t0) + (idx / fps) for idx in range(len(outs))]
-        idxs = indices if outs and len(outs) == len(indices) else list(range(len(outs)))
-        return outs, pts, idxs
-
-    fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
-    if fps <= 0:
-        fps = 25.0
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    if total <= 0:
-        cap.release()
-        return [], [], []
-
-    # 目标索引（顺序）
-    if count <= 1:
-        target_idxs = [total // 2]
-    else:
-        target_idxs = [int(round((k + 1) / (count + 1) * total)) for k in range(count)]
-    target_set = set(target_idxs)
-    target_sorted = sorted(target_idxs)
-
-    paths, pts, fidx = [], [], []
-    cur_read_idx = -1
-    next_target_i = 0
-
-    try:
-        while next_target_i < len(target_sorted):
-            ret, frame = cap.read()
-            if not ret:
-                break
-            cur_read_idx += 1
-            # 直接顺播直到命中目标帧
-            if cur_read_idx == target_sorted[next_target_i]:
-                name = f"{tag}_snap_{len(paths):04d}.jpg"
-                out_path = os.path.join(out_dir, name)
-                _imwrite_jpg(out_path, frame, quality=jpg_quality)
-                paths.append(out_path)
-                pts.append(float(seg_t0) + (cur_read_idx / fps))
-                fidx.append(cur_read_idx)
-                next_target_i += 1
-    finally:
-        cap.release()
-
-    if paths:
-        return paths, pts, fidx
-
-    # ---- OpenCV 顺播失败 → FFmpeg 兜底 ----
-    logger.warning("[A] OpenCV固定抽帧未取到图片，回落到 FFmpeg 抓帧（按索引或等间隔）")
-    outs = _ffmpeg_grab_frames_by_indices(video_path, out_dir, tag, target_sorted)
-    if not outs:
-        # 最后备选：按等间隔
-        interval = max(1.0, (total / max(1, count)) / max(1.0, fps))
-        outs = _ffmpeg_grab_frames_by_interval(video_path, out_dir, tag, interval)
-    if not outs:
-        return [], [], []
-
-    # 兜底下的 pts/idx 近似填充
-    pts2 = [float(seg_t0) + i * max(1.0 / fps, 0.04) for i in range(len(outs))]
-    idxs2 = target_sorted if len(outs) == len(target_sorted) else list(range(len(outs)))
-    return outs, pts2, idxs2
-
-
-# -------------------- 关键帧/小视频策略表 --------------------
-VLM_POLICY = {
-    MODEL.ONLINE: {
-        "interval_sec": 1.0,
-        "max_frames": 3,
-        "hires": False,
-        "small_video": False,
-        "small_video_encode": {"fps": 8, "height": 480, "crf": 28, "preset": "veryfast"},
-    },
-    MODEL.SECURITY: {
-        "interval_sec": 1.0,
-        "max_frames_signif": 5,
-        "count_nonsignif": 2,
-        "hires": False,
-        "small_video": False,  # SECURITY 下禁止小视频
-        "small_video_encode": {"fps": 8, "height": 480, "crf": 28, "preset": "veryfast"},
-    },
-    MODEL.OFFLINE: {
-        "interval_sec": 1.0,
-        "max_frames_nonsignif": 6,
-        "hires": False,
-        "small_video": True,
-        "small_video_encode": {"fps": 8, "height": 480, "crf": 28, "preset": "veryfast"},
-    },
-}
-
-
-def decide_vlm_sampling(mode: MODEL, significant_motion: bool) -> Dict:
-    cfg = VLM_POLICY[mode]
-    policy = {
-        "extract_keyframes": False,
-        "interval_sec": cfg.get("interval_sec", 1.0),
-        "max_frames": None,
-        "use_fixed_sampling": False,
-        "fixed_count": 0,
-        "emit_small_video": False,
-        "encode": cfg.get("small_video_encode", {"fps": 8, "height": 480, "crf": 28, "preset": "veryfast"}),
-        "hires": cfg.get("hires", False),
-    }
-    if mode == MODEL.ONLINE:
-        policy["extract_keyframes"] = True
-        policy["max_frames"] = cfg.get("max_frames", 3)
-    elif mode == MODEL.SECURITY:
-        if significant_motion:
-            policy["extract_keyframes"] = True
-            policy["max_frames"] = cfg.get("max_frames_signif", 5)
-        else:
-            policy["use_fixed_sampling"] = True
-            policy["fixed_count"] = cfg.get("count_nonsignif", 2)
-    else:  # OFFLINE
-        if significant_motion:
-            policy["emit_small_video"] = cfg.get("small_video", True)
-        else:
-            policy["extract_keyframes"] = True
-            policy["max_frames"] = cfg.get("max_frames_nonsignif", 6)
-    return policy
+        return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def _safe_put_with_ctrl(
-    q: Optional[Queue], obj: dict, q_ctrl: Queue, stop: object,
-    *, timeout=0.2, max_tries=50
+    q: Optional[Queue],
+    obj: dict,
+    q_ctrl: Queue,
+    stop: object,
+    *,
+    timeout: float = 0.2,
+    max_tries: int = 50
 ) -> bool:
+    """生产者安全投递，期间优先响应 STOP 控制。"""
     if q is None:
         return False
-
     tries = 0
     while True:
-        # ---- 控制优先：收到 STOP 立即放弃本次投递 ----
+        # 优先处理 STOP
         try:
             msg = q_ctrl.get_nowait()
             if msg is stop or (isinstance(msg, dict) and msg.get("type") in ("STOP", "SHUTDOWN")):
-                logger.info("[A] 检测到控制队列 STOP，停止将本次切片传递到数据队列。")
+                logger.info("[A] 检测到 STOP, 放弃投递。")
                 return False
             try:
                 q_ctrl.put_nowait(msg)
@@ -557,130 +76,392 @@ def _safe_put_with_ctrl(
         except Empty:
             pass
 
-        # ---- 尝试 put ----
         try:
             q.put(obj, timeout=timeout)
             return True
         except Full:
             tries += 1
             if tries >= max_tries:
-                logger.warning("[A] 队列持续拥堵，放弃投递。")
+                logger.warning("[A] 队列拥堵，放弃投递。")
                 return False
         except Exception as e:
-            logger.warning(f"[A] put 发生异常，将视为失败：{e}")
+            logger.warning(f"[A] put 异常：{e}")
             return False
 
 
-# -------------------- A 线程主体 --------------------
+def _drain_queue_completely(q: Optional[Queue], max_batch: int = 200000) -> int:
+    """尽最大努力丢弃队列中全部元素，返回丢弃个数。"""
+    if q is None:
+        return 0
+    dropped = 0
+    for _ in range(max_batch):
+        try:
+            q.get_nowait()
+            dropped += 1
+        except Empty:
+            break
+        except Exception:
+            break
+    if dropped:
+        logger.info("[A] 已清空下游队列：丢弃 %d 条旧消息。", dropped)
+    return dropped
+
+
+# ===================== 关键帧选择 =====================
+def pick_best_change_frame_with_pts(
+    video_path: str,
+    out_dir: str,
+    tag: str,
+    *,
+    seg_t0: float,
+    alpha_bgr: float = 0.5,
+    topk_frames: int = 1
+) -> Tuple[List[str], List[float], List[int]]:
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        logger.warning("[A] 无法打开视频, 准备回退到固定抽1帧。")
+        return [], [], []
+
+    try:
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
+        if fps <= 0:
+            fps = 25.0
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        stride = max(1, (total // EXPECT_CANDS) if total > 0 else int(round(fps / 4)))
+
+        prev_small = None
+        prev_gray = None
+        candidates: List[Tuple[float, int, float, np.ndarray]] = []
+
+        while True:
+            for _ in range(stride - 1):
+                if not cap.grab():
+                    break
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            cur_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+            small = resize_keep_w(frame, RESIZE_W)
+            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+
+            if prev_small is not None and prev_gray is not None:
+                br = bgr_ratio_score(prev_small, small)  # 0~1 越大越不同
+                sv = ssim_gray(prev_gray, gray)          # 0~1 越大越相似
+                score = alpha_bgr * br + (1.0 - alpha_bgr) * (1.0 - sv)
+            else:
+                score = -1.0
+
+            pts = float(seg_t0) + (cur_idx / fps)
+            candidates.append((score, cur_idx, pts, frame.copy()))
+            prev_small, prev_gray = small, gray
+
+        if not candidates:
+            return [], [], []
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        k = max(1, int(topk_frames) if topk_frames else 1)
+        selected = candidates[:k]
+        selected.sort(key=lambda x: x[1])
+
+        os.makedirs(out_dir, exist_ok=True)
+        paths: List[str] = []
+        pts_list: List[float] = []
+        idxs: List[int] = []
+
+        for rank, (_score, idx, pts, frame_bgr) in enumerate(selected):
+            out_path = os.path.join(out_dir, f"{tag}_kf_{rank:02d}_n{idx:06d}.jpg")
+            imwrite_jpg(out_path, frame_bgr, quality=90)
+            paths.append(out_path)
+            pts_list.append(pts)
+            idxs.append(idx)
+
+        return paths, pts_list, idxs
+
+    finally:
+        cap.release()
+
+
+def sample_one_frame_with_pts(
+    video_path: str,
+    out_dir: str,
+    tag: str,
+    *,
+    seg_t0: float
+) -> Tuple[List[str], List[float], List[int]]:
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        fps, total = get_video_meta(video_path)
+        if total <= 0:
+            return [], [], []
+        outs = grab_frame_by_index(video_path, out_dir, f"{tag}_snap_0000", total // 2)
+        if not outs:
+            return [], [], []
+        if fps <= 0:
+            fps = 25.0
+        return outs[:1], [float(seg_t0) + (total // 2) / fps], [total // 2]
+
+    try:
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
+        if fps <= 0:
+            fps = 25.0
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if total <= 0:
+            cap.release()
+            return [], [], []
+
+        target_idx = total // 2
+        cur_idx = -1
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            cur_idx += 1
+            if cur_idx == target_idx:
+                out_path = os.path.join(out_dir, f"{tag}_snap_0000.jpg")
+                imwrite_jpg(out_path, frame, quality=90)
+                return [out_path], [float(seg_t0) + (cur_idx / fps)], [cur_idx]
+    finally:
+        cap.release()
+
+    outs = grab_frame_by_index(video_path, out_dir, f"{tag}_snap_0000", target_idx)
+    if not outs:
+        return [], [], []
+    return outs[:1], [float(seg_t0) + (target_idx / fps)], [target_idx]
+
+
+def get_now_wait_formatted_time(timestamp: float) -> Tuple[str, str]:
+    # timestamp 为预计下一轮循环开始的时间戳
+    import datetime
+    now_date_obj = datetime.datetime.now()
+    wait_date_obj = datetime.datetime.fromtimestamp(timestamp)
+    now_date_formatted = now_date_obj.strftime("%Y-%m-%d %H:%M:%S")
+    wait_date_formatted = wait_date_obj.strftime("%Y-%m-%d %H:%M:%S")
+    return now_date_formatted, wait_date_formatted
+
+
+# ===================== 主线程（支持 OFFLINE / 单流RTSP / 轮询RTSP + 动态增删改流 & 动态改间隔） =====================
 def worker_a_cut(
-    url: str,
+    url: Optional[str],
+    rtsp_batch_config: Optional[RTSPBatchConfig],
     have_audio_track: bool,
     mode: MODEL,
-    slice_sec: int,
-    q_audio: Optional[Queue],   # <- 可选队列
-    q_video: Optional[Queue],   # <- 可选队列
+    q_audio: Optional[Queue],
+    q_video: Optional[Queue],
     q_ctrl: Queue,
     stop: object,
+    cut_config: CutConfig = None,
 ):
-    """
-    A 侧流程总览（切片 → 标准化 → 取帧/小视频 → 兜底）【运维备注】
-
-    一、时间窗策略
-    - 由 (_mode_window_policy) 基于 mode 与 slice_sec 计算 (win, step)：
-    SECURITY：win∈[4,12]，step=win（默认建议 4~8s，实时告警取短窗）
-    ONLINE  ：win∈[5,16]，step=win（默认建议 5~10s，面向直播看板）
-    OFFLINE ：win∈[8,30]，step=win-overlap（默认建议 8~12s，可轻重叠）
-    - t0 按 step 递增；离线到 EOF 做尾窗兜底后退出；实时常驻。
-
-    二、切片与标准化（FFmpeg，无中间临时文件）
-    - 函数：FFmpegUtils.cut_and_standardize_segment(src_url, t0, win, …)
-    1) 探测源是否有视频/音频流（ffprobe）
-    2) 视频：先尝试「流拷贝」(-c:v copy, -an) 输出无声 mp4；
-        若容器/时间基异常导致失败 → 自动回退「重编码」输出；
-    3) 音频：恒定重采样为 16k/mono/PCM16 的 wav
-    - 返回：{"video_path"|None, "audio_path"|None, "t0","t1","duration","index","have_audio"}
-    - 允许失败：若源/段损坏，可能返回 None 或空文件；上游必须检查存在且 size>0。
-
-    三、运动检测（轻量、仅用于策略选择）
-    - fast_motion_detect_placeholder：1Hz 采样 + 邻帧差分均值
-    - 输出布尔 significant_motion，用于决定 VLM 取帧策略（不影响切片本身）
-
-    四、取帧/小视频策略（按模式与运动情况）
-    - 策略选择（decide_vlm_sampling）：
-    SECURITY：无显著运动 → 固定抽帧；有显著运动 → 间隔关键帧
-    ONLINE  ：恒走「间隔关键帧」
-    OFFLINE ：显著运动 → 允许小视频；否则走「间隔关键帧」
-    - 小视频仅在 OFFLINE 允许（SECURITY/ONLINE 强制禁用）：
-    - compress_video_for_vlm(in→out, fps/height/crf/preset)
-    - 失败则回退到图像策略
-
-    五、抽帧实现与多级兜底（关键！）
-    1) 固定抽帧（sample_fixed_frames_with_pts）
-    优先级：SECURITY(无显著) > OFFLINE(无小视频且不显著) 可能使用
-    路线：
-    a. OpenCV「顺播」读取，按目标索引（等分全片）命中即保存
-    b. 若 OpenCV 打不开或顺播失败 → FFmpeg 兜底
-        - 按帧索引近似导出（select='eq(n,idx)'），命不中则跳过该张
-        - 再不行 → 按时间等间隔 fps=1/interval 抓帧
-    c. 返回 (paths, pts≈t0+idx/fps, frame_indices)；兜底场景下 pts/idx 可能近似
-
-    2) 间隔关键帧（extract_keyframes_by_interval_with_pts）
-    优先级：ONLINE；SECURITY(显著运动)；OFFLINE(不显著且禁小视频)
-    路线：
-    a. OpenCV：每 interval 取一帧，做相邻差分（阈值 0.65）筛“变化大”的帧
-    b. OpenCV 打不开 → FFmpeg 兜底（fps=1/interval 等间隔导出）
-    c. 同样返回 (paths, pts≈t0+idx/fps, frame_indices)；兜底时为近似值
-
-    3) 小视频（仅 OFFLINE & 显著运动）
-    a. 压缩成功 → small_video_path + fps
-    b. 失败 → 回落到（1）或（2）的图像路径
-
-    六、队列投递与跳过条件
-    - 仅当「有视频」且（small_video_path 或 keyframes 非空）时才投 q_video
-    - 有音轨且需要 ASR 时投 q_audio（附带静音探测提示）
-    - 若视频抽帧/小视频全失败 → 记录 WARNING 并跳过该段（不投 B）
-
-    七、时间戳与对齐
-    - 每段携带 clip_t0/clip_t1（=t0/t1），用于下游统一时间线
-    - 每张图像附带 frame_pts≈t0+idx/fps（兜底路径为近似）
-
-    八、日志与排障要点
-    - 关键 INFO：
-    [A] seg#N mode=… signif=… policy: emit_small_video=…, use_fixed_sampling=…, extract_keyframes=…
-    - 关键 WARNING：
-    - “待抽取固定帧视频，无法通过 OpenCV 打开，使用 FFmpeg 兜底”
-    - “固定抽帧未取到图片，回落到按间隔关键帧策略/FFmpeg 抓帧”
-    - “待抽取关键帧视频，无法通过 OpenCV 打开，使用 FFmpeg 兜底”
-    - “无可用的小视频/关键帧文件，跳过该段”
-    - 常见外部原因：RTSP 不支持 PAUSE、H264 比特流损坏、B 帧/时间基异常导致 seek 困难
-
-    九、参数建议
-    - slice_sec：SECURITY/ONLINE 取 5~10s；OFFLINE 8~12s（可小重叠）
-    - diff_threshold：0.65（图像差分）；motion diff_threshold：15.0
-    - JPG 质量 90；关键帧 interval 默认 1.0s（按需调整）
-
-    （本说明仅描述 A 侧，B/C 侧的节流/对齐由主控与 skew_guard 决定）
-    """
-
     running = False
     paused = False
     cur_mode = mode
-    desire_win = max(1, int(slice_sec))
-    overlap_sec = 0.0  # offline only
-    t0 = 0.0
-    seg_idx = 0
-    out_dir = "out"
 
-    # 离线有总时长；RTSP/直播 None
-    max_duration: Optional[float] = None
-    try:
-        max_duration = FFmpegUtils._probe_duration_seconds(url)
-    except Exception:
-        logger.warning("[A] FFmpeg 获取媒体总时长失败，按实时流常驻处理")
-    tail_emitted = False  # offline 尾窗兜底只发一次
+    # —— 恢复后是否需要 RTSP 跳直播点 —— #
+    resume_jump_to_live = False
 
-    def drain_ctrl_once() -> Optional[str]:
-        nonlocal running, paused, cur_mode, desire_win, overlap_sec
+    # ---- 解析配置 ----
+    cut_config = cut_config or CutConfig()
+    cut_window_sec = float(cut_config.cut_window_sec)
+    alpha_bgr = float(cut_config.alpha_bgr)
+    topk_frames = int(cut_config.topk_frames)
+    logger.info(
+        f"[A] 切片配置：窗口 {cut_window_sec}s，alpha_bgr={alpha_bgr}, "
+        f"topK={topk_frames}, has_audio_track={have_audio_track}"
+    )
+
+    # 离线总时长（RTSP/直播 → None）
+    def _probe_duration(u: Optional[str]) -> Optional[float]:
+        if not u:
+            return None
+        try:
+            return probe_duration_seconds(u)
+        except Exception:
+            return None
+
+    # ---------- 控制消息处理 ----------
+    def _handle_add_stream(msg: Dict[str, Any], cur_list: List[Any]) -> None:
+        """动态增加一条流：兼容 {type:'ADD_STREAM', stream:{...}} / {type:'RTSP_ADD_STREAM', item:{...}}"""
+        st = msg.get("stream")
+        if st is None:
+            st = msg.get("item")
+        if st is None:
+            logger.warning("[A] ADD_STREAM 缺少 'stream' 或 'item'")
+            return
+        try:
+            if isinstance(st, RTSP):
+                new_item = st
+            elif isinstance(st, dict):
+                new_item = RTSP(**st)
+            else:
+                logger.warning("[A] ADD_STREAM 非法类型：%r", type(st))
+                return
+        except Exception as e:
+            logger.warning("[A] ADD_STREAM 构造 RTSP 失败：%s", e)
+            return
+
+        # 轮询模式下：最多 50 路，和主控一致
+        if cur_mode == MODEL.SECURITY_POLLING and len(cur_list) >= 50:
+            logger.warning(
+                "[A] ADD_STREAM 被拒：SECURITY_POLLING 模式最多 50 路（当前=%d）",
+                len(cur_list)
+            )
+            return
+
+        # 去重（按 url）
+        urls = [it.rtsp_url for it in cur_list]
+        if new_item.rtsp_url in urls:
+            logger.info("[A] ADD_STREAM 已存在：%s（忽略）", new_item.rtsp_url)
+            return
+        cur_list.append(new_item)
+        logger.info("[A] ADD_STREAM 成功：%s（当前共 %d 路）", new_item.rtsp_url, len(cur_list))
+
+    def _handle_remove_stream(msg: Dict[str, Any], cur_list: List[Any]) -> None:
+        """动态删除一条流：兼容 {type:'REMOVE_STREAM'| 'RTSP_REMOVE_STREAM', rtsp_url:'...'}"""
+        u = msg.get("rtsp_url")
+        if not u:
+            logger.warning("[A] REMOVE_STREAM 缺少 'rtsp_url'")
+            return
+
+        before = len(cur_list)
+        # 轮询模式下：至少保留 2 路，与主控一致
+        if cur_mode == MODEL.SECURITY_POLLING and before <= 2:
+            logger.warning(
+                "[A] REMOVE_STREAM 被拒：SECURITY_POLLING 模式下需要至少 2 路（当前=%d）",
+                before
+            )
+            return
+
+        cur_list[:] = [it for it in cur_list if it.rtsp_url != u]
+        after = len(cur_list)
+        if after < before:
+            logger.info("[A] REMOVE_STREAM 成功：%s（剩余 %d 路）", u, after)
+        else:
+            logger.info("[A] REMOVE_STREAM 未找到：%s（保持 %d 路）", u, after)
+
+    def _handle_update_stream(msg: Dict[str, Any], cur_list: List[Any]) -> None:
+        """
+        动态更新一条流（原位替换）：
+        兼容 {type:'RTSP_UPDATE_STREAM'|'UPDATE_STREAM', old_rtsp_url: str, item: {..}, index?: int}
+        - SECURITY_SINGLE：只替换索引 0（且最好匹配 old_rtsp_url）
+        - SECURITY_POLLING：优先使用 index；否则用 old_rtsp_url 定位；防重复
+        """
+        old_url = msg.get("old_rtsp_url")
+        item = msg.get("item") or {}
+        idx_hint = msg.get("index")
+
+        # 构造新 RTSP
+        try:
+            if isinstance(item, RTSP):
+                new_obj = item
+            elif isinstance(item, dict):
+                new_obj = RTSP(**item)
+            else:
+                logger.warning("[A] UPDATE_STREAM item 类型无效：%r", type(item))
+                return
+        except Exception as e:
+            logger.warning("[A] UPDATE_STREAM 构造 RTSP 失败：%s", e)
+            return
+
+        if cur_mode == MODEL.SECURITY_SINGLE:
+            if not cur_list:
+                logger.warning("[A] UPDATE_STREAM：单流模式但列表为空")
+                return
+            # 避免误改：如果给了 old_url 且不匹配，提示并继续按 0 替
+            if old_url and cur_list[0].rtsp_url != old_url:
+                logger.warning(
+                    "[A] UPDATE_STREAM(SECURITY_SINGLE) old_rtsp_url 不匹配：%s != %s（仍将替换索引0）",
+                    cur_list[0].rtsp_url,
+                    old_url,
+                )
+            cur_list[0] = new_obj
+            logger.info("[A] 单流已更新：%s → %s", old_url, new_obj.rtsp_url)
+            return
+
+        if cur_mode == MODEL.SECURITY_POLLING:
+            if not cur_list:
+                logger.warning("[A] UPDATE_STREAM：轮询模式但列表为空")
+                return
+
+            # 定位索引：优先 index，其次 old_url
+            repl_idx = None
+            if isinstance(idx_hint, int) and 0 <= idx_hint < len(cur_list):
+                repl_idx = idx_hint
+            elif old_url:
+                for i, it in enumerate(cur_list):
+                    if getattr(it, "rtsp_url", None) == old_url:
+                        repl_idx = i
+                        break
+            if repl_idx is None:
+                logger.warning("[A] UPDATE_STREAM 未找到可替换项（old_rtsp_url/index 无效）")
+                return
+
+            # 防止与其他路重复
+            for j, it in enumerate(cur_list):
+                if j == repl_idx:
+                    continue
+                if getattr(it, "rtsp_url", None) == new_obj.rtsp_url:
+                    logger.warning("[A] UPDATE_STREAM 新 URL 与其他路重复：%s（放弃）", new_obj.rtsp_url)
+                    return
+
+            cur_list[repl_idx] = new_obj
+            logger.info("[A] 轮询路[%d] 已更新：%s → %s", repl_idx, old_url, new_obj.rtsp_url)
+            return
+
+        logger.warning("[A] UPDATE_STREAM：当前模式不支持：%s", cur_mode)
+
+    def _handle_update_interval(msg: Dict[str, Any], batch_obj: Optional[RTSPBatchConfig]) -> None:
+        """
+        动态更新轮询间隔：兼容 {type:'RTSP_UPDATE_INTERVAL'|'UPDATE_INTERVAL', polling_batch_interval:int}
+        仅 SECURITY_POLLING 下有效。
+        """
+        if cur_mode != MODEL.SECURITY_POLLING:
+            logger.warning("[A] UPDATE_INTERVAL 仅在 SECURITY_POLLING 下有效（当前：%s）", cur_mode)
+            return
+        if not batch_obj:
+            logger.warning("[A] UPDATE_INTERVAL 收到但 batch_obj 未初始化")
+            return
+        try:
+            ni = float(msg.get("polling_batch_interval"))
+        except Exception:
+            logger.warning("[A] UPDATE_INTERVAL 值无效：%r", msg.get("polling_batch_interval"))
+            return
+        if ni < 10.0:
+            logger.warning("[A] UPDATE_INTERVAL 过小，被拒：%.3fs < 10.0", ni)
+            return
+        old = batch_obj.polling_batch_interval
+        batch_obj.polling_batch_interval = ni
+        logger.info(f"[A] 轮询间隔已更新: {old} → {ni}（下一轮生效）")
+
+    def _handle_update_cut_window_sec(msg: Dict[str, Any]) -> None:
+        nonlocal cut_window_sec, cur_mode
+
+        if cur_mode not in (MODEL.SECURITY_SINGLE, MODEL.SECURITY_POLLING):
+            logger.warning(
+                "[A] UPDATE_CUT_WINDOW_SEC 仅在 SECURITY_SINGLE / SECURITY_POLLING 下有效（当前：%s）",
+                cur_mode,
+            )
+            return
+
+        raw = msg.get("cut_window_sec")
+        try:
+            cws = float(raw)
+        except (TypeError, ValueError):
+            logger.warning("[A] UPDATE_CUT_WINDOW_SEC 值无效：%r", raw)
+            return
+
+        if cws < 1.0:
+            logger.warning("[A] UPDATE_CUT_WINDOW_SEC 过小, 被拒: %.3f < 1.0", cws)
+            return
+
+        old = cut_window_sec
+        cut_window_sec = cws
+        logger.info("[A] 切片时长已更新: %.3fs → %.3fs (下一流生效)", old, cws)
+
+    def drain_ctrl_once(
+        current_streams: Optional[List[Any]] = None,
+        batch_obj: Optional[RTSPBatchConfig] = None
+    ) -> Optional[str]:
+        nonlocal running, paused, cur_mode, resume_jump_to_live
         try:
             msg = q_ctrl.get_nowait()
         except Empty:
@@ -692,225 +473,700 @@ def worker_a_cut(
         if isinstance(msg, dict):
             typ = msg.get("type")
             if typ == "START":
-                logger.info("[A] 收到 START，开始切片")
                 running = True
+                logger.info("[A] START")
             elif typ == "PAUSE":
-                logger.info("[A] 收到 PAUSE，暂停切片")
                 paused = True
+                logger.info("[A] PAUSE")
             elif typ == "RESUME":
-                logger.info("[A] 收到 RESUME，继续切片")
                 paused = False
+                # RTSP 模式：恢复后对齐到直播点；OFFLINE 不跳
+                if cur_mode in (MODEL.SECURITY_SINGLE, MODEL.SECURITY_POLLING):
+                    resume_jump_to_live = True
+                    # 清理下游未消费的“旧切片”
+                    _drain_queue_completely(q_video)
+                    _drain_queue_completely(q_audio)
+                    logger.info("[A] RESUME（RTSP）：将跳到直播点，并清理未消费队列。")
+                else:
+                    logger.info("[A] RESUME（OFFLINE）：继续旧 t0。")
             elif typ == "MODE_CHANGE":
                 val = msg.get("value")
                 try:
-                    # 既兼容传入枚举，也兼容传入字符串 value
-                    cur_mode = val if isinstance(val, MODEL) else MODEL(str(val))
-                    logger.info(f"[A] 模式切换为：{cur_mode}")
+                    cur_mode_local = val if isinstance(val, MODEL) else MODEL(str(val))
+                    cur_mode = cur_mode_local
+                    logger.info(f"[A] MODE_CHANGE → {cur_mode}")
                 except Exception:
                     logger.warning("[A] MODE_CHANGE 值无法解析：%r", val)
-            elif typ == "UPDATE_SLICE":
-                try:
-                    desire_win = max(1, int(msg.get("value", desire_win)))
-                    logger.info(f"[A] 切窗大小更新：{desire_win}")
-                except Exception:
-                    pass
-            elif typ == "UPDATE_OVERLAP":
-                try:
-                    overlap_sec = float(msg.get("value", overlap_sec))
-                    logger.info(f"[A] 窗口重叠更新：{overlap_sec}")
-                except Exception:
-                    pass
+
+            # --- 动态流：兼容 RTSP_* 与无前缀 ---
+            elif typ in ("ADD_STREAM", "RTSP_ADD_STREAM") and current_streams is not None:
+                _handle_add_stream(msg, current_streams)
+            elif typ in ("REMOVE_STREAM", "RTSP_REMOVE_STREAM") and current_streams is not None:
+                _handle_remove_stream(msg, current_streams)
+            elif typ in ("RTSP_UPDATE_STREAM", "UPDATE_STREAM") and current_streams is not None:
+                _handle_update_stream(msg, current_streams)
+            elif typ in ("RTSP_UPDATE_INTERVAL", "UPDATE_INTERVAL"):
+                _handle_update_interval(msg, batch_obj)
+            elif typ in ("RTSP_UPDATE_CUT_WINDOW_SEC", "UPDATE_CUT_WINDOW_SEC"):
+                _handle_update_cut_window_sec(msg)
+
             elif typ in ("STOP", "SHUTDOWN"):
                 return "STOP"
         return None
 
-    try:
+    def _wait_run(
+        current_streams: Optional[List[Any]] = None,
+        batch_obj: Optional[RTSPBatchConfig] = None
+    ):
+        """等待 running 且非 paused；期间处理控制与动态流。"""
         while True:
-            # 控制优先，降低延迟
+            res = drain_ctrl_once(current_streams, batch_obj)
+            if res == "STOP":
+                return False
+            if running and (not paused):
+                return True
+            sleep(0.02)
+
+    # ---- 公共一次切窗 + 关键帧 + 投递 ----
+    def _cut_emit_once(
+        *,
+        src_url: str,
+        segment_index: int,
+        tag_prefix: str,
+        have_audio: bool,
+        stream_index: Optional[int] = None,
+        stream_seg_index: Optional[int] = None,
+        polling_round_index: Optional[int] = None,
+        rtsp_system_prompt: Optional[object] = None,
+        step_hint_t0: float = 0.0,
+        window_index_in_stream: int = 0,
+        on_result: Optional[Callable[[bool], None]] = None,
+    ) -> bool:
+        """
+        返回 False 表示检测到 STOP 或致命失败需退出上层循环。
+        注意：对 RTSP，ffmpeg 实际抓取应当以“当前直播点”为主；step_hint_t0 仅用于时间轴元数据。
+
+        on_result: 可选回调，参数为 bool：
+            True  表示本次切片成功（产出了有效音/视频）；
+            False 表示本次切片失败（ffmpeg 异常 / 结果为空），用于轮询模式统计坏流。
+        """
+        try:
+            seg = cut_and_standardize_segment(
+                src_url=src_url,
+                start_time=step_hint_t0,
+                duration=cut_window_sec,
+                output_dir=OUT_DIR,
+                segment_index=segment_index,
+                have_audio=have_audio,
+            )
+        except Exception as e:
+            logger.error(
+                "[A] 切片失败(src=%s, seg_index=%d): %s, 跳过该切片",
+                src_url,
+                segment_index,
+                e,
+            )
+            if on_result is not None:
+                try:
+                    on_result(False)
+                except Exception as cb_e:
+                    logger.warning("[A] on_result 回调异常(失败路径)：%s", cb_e)
+            # 对 RTSP/轮询模式：单路/单片失败直接跳过；OFFLINE 也继续下一片段
+            return True
+
+        v_out = seg.get("video_path")
+        a_out = seg.get("audio_path")
+        has_v = _file_exists_nonzero(v_out)
+        has_a = _file_exists_nonzero(a_out)
+
+        # 如果既没有视频也没有音频，视为一次失败
+        if not has_v and not has_a:
+            logger.warning(
+                "[A] seg#%s 切片结果为空(src=%s)，视为失败，跳过该片段。",
+                segment_index,
+                src_url,
+            )
+            if on_result is not None:
+                try:
+                    on_result(False)
+                except Exception as cb_e:
+                    logger.warning("[A] on_result 回调异常(空结果路径)：%s", cb_e)
+            return True
+
+        # 时间元数据
+        seg_t0_rel = float(seg.get("t0") or 0.0)
+        seg_t1_rel = float(seg.get("t1") or (seg_t0_rel + cut_window_sec))
+        seg_t0_epoch = seg.get("t0_epoch")
+        seg_t1_epoch = seg.get("t1_epoch")
+        seg_t0_iso = seg.get("t0_iso") or (_epoch_to_iso_utc(seg_t0_epoch) if seg_t0_epoch else None)
+        seg_t1_iso = seg.get("t1_iso") or (_epoch_to_iso_utc(seg_t1_epoch) if seg_t1_epoch else None)
+
+        # 关键帧挑选 & 投递
+        if has_v and q_video is not None:
+            tag = f"{tag_prefix}_seg{segment_index:06d}"
+            paths, pts, idxs = pick_best_change_frame_with_pts(
+                v_out,
+                OUT_DIR,
+                tag,
+                seg_t0=seg_t0_rel,
+                alpha_bgr=alpha_bgr,
+                topk_frames=topk_frames,
+            )
+            if not paths:
+                paths, pts, idxs = sample_one_frame_with_pts(
+                    v_out,
+                    OUT_DIR,
+                    tag,
+                    seg_t0=seg_t0_rel,
+                )
+
+            if paths:
+                if seg_t0_epoch is not None:
+                    frame_epoch = [float(seg_t0_epoch) + (float(p) - seg_t0_rel) for p in pts]
+                    frame_iso = [_epoch_to_iso_utc(ep) for ep in frame_epoch]
+                else:
+                    frame_epoch = []
+                    frame_iso = []
+
+                payload_video: Dict[str, object] = {
+                    "path": v_out,
+                    "t0": seg_t0_rel,
+                    "t1": seg_t1_rel,
+                    "t0_iso": seg_t0_iso,
+                    "t1_iso": seg_t1_iso,
+                    "t0_epoch": seg_t0_epoch,
+                    "t1_epoch": seg_t1_epoch,
+                    "clip_t0": seg_t0_rel,
+                    "clip_t1": seg_t1_rel,
+                    "segment_index": segment_index,
+                    "keyframes": paths,  # 关键帧存放路径
+                    "frame_pts": pts,
+                    "frame_indices": idxs,
+                    "frame_epoch": frame_epoch,
+                    "frame_iso": frame_iso,
+                    "small_video": None,
+                    # 透传源流信息（上游/前端渲染）
+                    "stream_url": src_url,
+                    "stream_index": stream_index,
+                    "stream_segment_index": stream_seg_index,
+                    "window_index_in_stream": window_index_in_stream,
+                    "polling_round_index": polling_round_index,
+                    "rtsp_system_prompt": rtsp_system_prompt,  # 可以是枚举或 str
+                }
+                if not _safe_put_with_ctrl(q_video, payload_video, q_ctrl, stop):
+                    return False
+            else:
+                logger.warning("[A] seg#%s 无可用证据帧，跳过视频侧。", segment_index)
+
+        # 音频侧
+        if has_a and have_audio and q_audio is not None:
+            audio_payload = {
+                "path": a_out,
+                "t0": seg_t0_rel,
+                "t1": seg_t1_rel,
+                "t0_iso": seg_t0_iso,
+                "t1_iso": seg_t1_iso,
+                "t0_epoch": seg_t0_epoch,
+                "t1_epoch": seg_t1_epoch,
+                "segment_index": segment_index,
+                "stream_index": stream_index,
+                "stream_segment_index": stream_seg_index,
+                "stream_url": src_url,
+                "polling_round_index": polling_round_index,
+            }
+            if not _safe_put_with_ctrl(q_audio, audio_payload, q_ctrl, stop):
+                return False
+
+        # 至少有一条音/视频产出，视为成功
+        if on_result is not None:
+            try:
+                on_result(True)
+            except Exception as cb_e:
+                logger.warning("[A] on_result 回调异常(成功路径)：%s", cb_e)
+
+        return True
+
+    # ===================== 三种模式的工作循环 =====================
+    def _loop_offline(local_url: str):
+        """OFFLINE：恢复后继续旧 t0，不清队列。"""
+        seg_idx = 0
+        t0 = 0.0
+        max_duration = _probe_duration(local_url)
+        tail_emitted = False
+
+        logger.info("[A] OFFLINE 循环：duration=%s", max_duration)
+        while True:
+            # 控制优先
             for _ in range(4):
                 res = drain_ctrl_once()
                 if res == "STOP":
-                    logger.info("[A] 收到控制队列 STOP，退出")
                     return
                 if not running or paused:
                     sleep(0.01)
-
             if not running or paused:
                 continue
 
-            # 窗口/步长（含 offline 重叠）
-            win, step = _mode_window_policy(cur_mode, desire_win, overlap_sec)
-
-            # 离线 EOF
+            # EOF
             if max_duration is not None and t0 >= max_duration:
-                if cur_mode == MODEL.OFFLINE and not tail_emitted and max_duration > 0:
-                    new_t0 = max(0.0, max_duration - win)
+                if not tail_emitted and max_duration > 0:
+                    new_t0 = max(0.0, max_duration - cut_window_sec)
                     if new_t0 + 1e-6 < t0:
                         t0 = new_t0
                         tail_emitted = True
                     else:
-                        logger.info("[A] 离线已切完，退出")
+                        logger.info("[A] 离线完成，退出。")
                         return
                 else:
-                    logger.info("[A] 离线已切完，退出")
+                    logger.info("[A] 离线完成，退出。")
                     return
 
-            # ---- 切窗+标准化 ----
-            seg = FFmpegUtils.cut_and_standardize_segment(
-                src_url=url, start_time=t0, duration=win,
-                output_dir=out_dir, segment_index=seg_idx, have_audio=have_audio_track
+            ok = _cut_emit_once(
+                src_url=local_url,
+                segment_index=seg_idx,
+                tag_prefix="offline",
+                have_audio=have_audio_track,
+                step_hint_t0=t0,
             )
-            v_out = seg.get("video_path")  # 可能为 None（纯音频源或导出失败）
-            a_out = seg.get("audio_path")  # 可能为 None（纯视频源或无音轨）
-            has_v = _file_exists_nonzero(v_out)
-            has_a = _file_exists_nonzero(a_out)
+            if not ok:
+                return
 
-            # 是否产出音频
-            produce_audio = bool(have_audio_track and q_audio is not None and has_a)
-
-            # 静音提示
-            if produce_audio:
-                silence_hint = silence_detect_hint(a_out)
-            else:
-                silence_hint = {"silence_ratio": 0.0, "is_mostly_silent": False, "segments": []}
-
-            # 运动 & 关键帧策略（仅当有视频且启用 B）
-            keyframes: List[str] = []
-            frame_pts: List[float] = []
-            frame_indices: List[int] = []
-            small_video_path: Optional[str] = None
-            small_video_fps: Optional[float] = None
-            policy_used = "none"
-            hires_flag = False
-
-            if has_v and q_video is not None:
-                signif = fast_motion_detect_placeholder(
-                    v_out, sample_interval=1.0, diff_threshold=15.0, max_samples=30
-                )
-                vlm_policy = decide_vlm_sampling(cur_mode, signif)
-                hires_flag = vlm_policy["hires"]
-                tag = f"seg{seg_idx:04d}"
-
-                # SECURITY/ONLINE 不会走小视频（配置已禁用）
-                if vlm_policy["emit_small_video"]:
-                    small_video_path = os.path.join(out_dir, f"{tag}_small.mp4")
-                    enc = vlm_policy["encode"]
-                    try:
-                        FFmpegUtils.compress_video_for_vlm(
-                            in_video=v_out, out_video=small_video_path,
-                            fps=enc.get("fps", 8), height=enc.get("height", 480),
-                            crf=enc.get("crf", 28), preset=enc.get("preset", "veryfast")
-                        )
-                        small_video_fps, _ = _get_video_meta(small_video_path)
-                        policy_used = "small_video"
-                    except Exception as e:
-                        logger.warning("[A] 小视频压缩失败，将回落到图像策略：%s", e)
-                        small_video_path = None
-                        small_video_fps = None
-
-                if not small_video_path:
-                    # 固定抽帧优先（更稳定），失败再回落到“间隔关键帧”
-                    imgs, pts, idxs = [], [], []
-                    if vlm_policy.get("use_fixed_sampling"):
-                        imgs, pts, idxs = sample_fixed_frames_with_pts(
-                            v_out, out_dir, tag,
-                            count=int(vlm_policy.get("fixed_count") or 2),
-                            jpg_quality=90, seg_t0=seg["t0"]
-                        )
-                        if imgs:
-                            policy_used = "fixed_sampling"
-                        else:
-                            logger.warning("[A] seg#%s 固定抽帧未取到图片，回落到按间隔关键帧策略。", seg_idx)
-
-                    if not imgs and vlm_policy.get("extract_keyframes"):
-                        dynamic_max = vlm_policy.get("max_frames")
-                        imgs, pts, idxs = extract_keyframes_by_interval_with_pts(
-                            v_out, out_dir, tag,
-                            interval_sec=float(vlm_policy["interval_sec"]),
-                            diff_threshold=0.65,
-                            max_frames=dynamic_max,
-                            seg_t0=seg["t0"]
-                        )
-                        if imgs:
-                            policy_used = "keyframes"
-
-                    keyframes, frame_pts, frame_indices = imgs, pts, idxs
-
-                # 兜底：若小视频被禁用且又没抽到任何图片→跳过视频侧
-                if not small_video_path and not keyframes:
-                    logger.warning("[A] seg#%s 无可用的小视频/关键帧文件，跳过该段。", seg_idx)
-
-                logger.info(
-                    "[A] seg#%s mode=%s signif=%s policy: emit_small_video=%s, use_fixed_sampling=%s, extract_keyframes=%s",
-                    seg_idx, cur_mode.value, bool(signif),
-                    bool(vlm_policy.get("emit_small_video")),
-                    bool(vlm_policy.get("use_fixed_sampling")),
-                    bool(vlm_policy.get("extract_keyframes")),
-                )
-            else:
-                signif = False
-
-            # ---- 投视频队列 ----
-            if has_v and q_video is not None and (small_video_path or keyframes):
-                payload_video = {
-                    "path": v_out,
-                    "t0": seg["t0"],
-                    "t1": seg["t1"],
-                    "clip_t0": seg["t0"],
-                    "clip_t1": seg["t1"],
-                    "segment_index": seg_idx,
-                    "mode": cur_mode.value,
-                    "win": win,
-                    "step": step,
-                    "overlap_sec": overlap_sec if cur_mode == MODEL.OFFLINE else 0.0,
-                    "has_audio": has_a,
-                    "keyframes": keyframes,
-                    "frame_pts": frame_pts,
-                    "frame_indices": frame_indices,
-                    "keyframe_count": len(keyframes),
-                    "small_video": small_video_path,
-                    "small_video_fps": small_video_fps,
-                    "hires": hires_flag,
-                    "policy": {
-                        "significant_motion": bool(signif),
-                        "policy_used": (policy_used or "none"),
-                        "interval_sec": (float(vlm_policy["interval_sec"]) if has_v and q_video is not None else 0.0),
-                        "max_frames": (vlm_policy.get("max_frames") if has_v and q_video is not None else None),
-                        "silence_hint": {
-                            "silence_ratio": float(silence_hint.get("silence_ratio", 0.0)),
-                            "is_mostly_silent": bool(silence_hint.get("is_mostly_silent", False)),
-                        },
-                    },
-                }
-                ok = _safe_put_with_ctrl(q_video, payload_video, q_ctrl, stop)
-                if not ok:
-                    return  # 退出 A 线程
-
-            # ---- 投音频队列 ----
-            if produce_audio and q_audio is not None:
-                audio_payload = {
-                    "path": a_out,
-                    "t0": seg["t0"],
-                    "t1": seg["t1"],
-                    "segment_index": seg_idx,
-                    "silence_hint": {
-                        "silence_ratio": float(silence_hint.get("silence_ratio", 0.0)),
-                        "is_mostly_silent": bool(silence_hint.get("is_mostly_silent", False)),
-                    },
-                }
-                ok = _safe_put_with_ctrl(q_audio, audio_payload, q_ctrl, stop)
-                if not ok:
-                    return
-
-            # 步进
             seg_idx += 1
-            t0 += step
-            if tail_emitted and max_duration is not None:
+            t0 += cut_window_sec
+            if tail_emitted and (max_duration is not None):
                 t0 = max_duration
-
             sleep(0.005)
 
+    def _loop_single_rtsp(rtsp_url: str, rtsp_prompt_obj: Optional[object]):
+        """单流 RTSP：恢复后跳直播点，并清空未消费旧片段。"""
+        nonlocal resume_jump_to_live
+
+        global_seg_idx = 0
+        t0_rel = 0.0
+        logger.info("[A] SECURITY_SINGLE 循环：%s", rtsp_url)
+
+        while True:
+            # 控制优先
+            for _ in range(4):
+                res = drain_ctrl_once()
+                if res == "STOP":
+                    return
+                if not running or paused:
+                    sleep(0.01)
+            if not running or paused:
+                continue
+
+            # 恢复 → 跳直播点 + 清队列（前面已做；这里只需重置相对轴并清标志）
+            if resume_jump_to_live:
+                t0_rel = 0.0
+                resume_jump_to_live = False
+                logger.info("[A] 单流：已对齐直播点（相对轴清零）。")
+
+            ok = _cut_emit_once(
+                src_url=rtsp_url,
+                segment_index=global_seg_idx,
+                tag_prefix="rtsp_s00",
+                have_audio=have_audio_track,
+                stream_index=0,
+                stream_seg_index=global_seg_idx,  # 单流时：全局 seg 等价“该流的 seg”
+                polling_round_index=None,
+                rtsp_system_prompt=rtsp_prompt_obj,
+                step_hint_t0=t0_rel,
+            )
+            if not ok:
+                return
+
+            global_seg_idx += 1
+            t0_rel += cut_window_sec
+            sleep(0.003)
+
+    def _loop_polling_rtsp(initial_batch: RTSPBatchConfig):
+        """
+        轮询 RTSP：
+        - 支持 ADD/REMOVE/UPDATE_STREAM、UPDATE_INTERVAL 控制；
+        - 恢复后跳直播点（清空未消费队列），并把每路相对轴清零；
+        - 新增：坏流检测与拉黑机制，仅在 SECURITY_POLLING 模式生效：
+            * 某一路连续 BAD_FAIL_THRESHOLD 次切片失败 → 标记为坏流（拉黑）；
+            * N 轮后尝试切片 1 次恢复；
+            * 若恢复失败 → 按轮次指数退避，尝试间隔轮数 <= min(16, 2N)；
+            * 恢复成功 → 清空坏流标记与计数，恢复正常轮询。
+        """
+        nonlocal resume_jump_to_live
+
+        # 当前活跃流列表（可被动态增删/改）
+        current_streams: List[Any] = list(initial_batch.polling_list or [])
+        # 每路分段号、相对轴
+        stream_seg_index: Dict[int, int] = {i: 0 for i in range(len(current_streams))}
+        stream_t0_rel: Dict[int, float] = {i: 0.0 for i in range(len(current_streams))}
+        # 全局分段号 & 轮询轮数
+        global_seg_idx = 0
+        polling_round_index = 0
+
+        # 坏流相关参数
+        BAD_FAIL_THRESHOLD = 3  # N：连续 N 次失败视为坏流，可按需调整
+        MAX_RETRY_GAP_ROUNDS = 16  # 尝试间隔轮数硬上限
+        # cap_gap = min(16, 2N)
+        RETRY_GAP_CAP = min(MAX_RETRY_GAP_ROUNDS, 2 * BAD_FAIL_THRESHOLD)
+
+        # 每路连续失败计数（仅正常阶段使用，坏流恢复阶段不再累加）
+        stream_fail_count: Dict[int, int] = {i: 0 for i in range(len(current_streams))}
+        # 每路是否被标记为坏流
+        bad_stream_flag: Dict[int, bool] = {i: False for i in range(len(current_streams))}
+        # 每路坏流：下一次尝试恢复的“轮次编号”
+        bad_stream_next_round: Dict[int, int] = {}
+        # 每路坏流：当前尝试间隔轮数（会指数退避，但不超过 RETRY_GAP_CAP）
+        bad_stream_retry_gap: Dict[int, int] = {}
+
+        logger.info(
+            "[A] SECURITY_POLLING 循环：初始 %d 路, batch_interval=%ss, "
+            "坏流阈值=%d, 最大尝试间隔轮=%d, cap_gap=%d",
+            len(current_streams),
+            int(initial_batch.polling_batch_interval),
+            BAD_FAIL_THRESHOLD,
+            MAX_RETRY_GAP_ROUNDS,
+            RETRY_GAP_CAP,
+        )
+
+        # 辅助：当 current_streams 变化后，重建映射字典（保持已存在流的状态不丢）
+        def _rebuild_per_stream_maps():
+            nonlocal stream_seg_index, stream_t0_rel
+            nonlocal stream_fail_count, bad_stream_flag, bad_stream_next_round, bad_stream_retry_gap
+
+            new_seg_index: Dict[int, int] = {}
+            new_t0_rel: Dict[int, float] = {}
+            new_fail_count: Dict[int, int] = {}
+            new_bad_flag: Dict[int, bool] = {}
+            new_next_round: Dict[int, int] = {}
+            new_retry_gap: Dict[int, int] = {}
+
+            for i, _item in enumerate(current_streams):
+                # seg & t0
+                if i in stream_seg_index:
+                    new_seg_index[i] = stream_seg_index[i]
+                    new_t0_rel[i] = stream_t0_rel[i]
+                else:
+                    new_seg_index[i] = 0
+                    new_t0_rel[i] = 0.0
+
+                # 连续失败计数
+                if i in stream_fail_count:
+                    new_fail_count[i] = stream_fail_count[i]
+                else:
+                    new_fail_count[i] = 0
+
+                # 坏流标记
+                if i in bad_stream_flag:
+                    new_bad_flag[i] = bad_stream_flag[i]
+                else:
+                    new_bad_flag[i] = False
+
+                # 恢复轮次
+                if i in bad_stream_next_round:
+                    new_next_round[i] = bad_stream_next_round[i]
+
+                # 间隔配置
+                if i in bad_stream_retry_gap:
+                    new_retry_gap[i] = bad_stream_retry_gap[i]
+
+            stream_seg_index = new_seg_index
+            stream_t0_rel = new_t0_rel
+            stream_fail_count = new_fail_count
+            bad_stream_flag = new_bad_flag
+            bad_stream_next_round = new_next_round
+            bad_stream_retry_gap = new_retry_gap
+
+        def _make_on_result(si: int, round_idx: int) -> Callable[[bool], None]:
+            """
+            为某个流 si 生成一次切片结果回调：
+            - success=True  表示该次切片成功；
+            - success=False 表示该次切片失败。
+            """
+            def _on_result(success: bool, si: int = si, round_idx: int = round_idx) -> None:
+                nonlocal stream_fail_count, bad_stream_flag, bad_stream_next_round, bad_stream_retry_gap
+
+                if si not in stream_fail_count:
+                    stream_fail_count[si] = 0
+                if si not in bad_stream_flag:
+                    bad_stream_flag[si] = False
+
+                # 正常阶段：还不是坏流
+                if not bad_stream_flag[si]:
+                    if success:
+                        # 任意一次成功清零连续失败计数
+                        if stream_fail_count[si]:
+                            stream_fail_count[si] = 0
+                    else:
+                        stream_fail_count[si] += 1
+                        if stream_fail_count[si] >= BAD_FAIL_THRESHOLD:
+                            # 连续 N 次失败 → 标记为坏流
+                            bad_stream_flag[si] = True
+                            stream_fail_count[si] = 0
+
+                            # 首次恢复尝试：N 轮后
+                            first_gap = BAD_FAIL_THRESHOLD
+                            gap = min(first_gap, RETRY_GAP_CAP)
+                            bad_stream_retry_gap[si] = gap
+                            next_round = round_idx + gap
+                            bad_stream_next_round[si] = next_round
+                            logger.warning(
+                                "[A] 轮询流[%d] 连续 %d 次切片失败，标记为坏流，将在 %d 轮后尝试恢复（目标轮=%d，cap_gap=%d）。",
+                                si,
+                                BAD_FAIL_THRESHOLD,
+                                gap,
+                                next_round,
+                                RETRY_GAP_CAP,
+                            )
+                    return
+
+                # 坏流恢复尝试阶段
+                if success:
+                    # 恢复成功：取消坏流标记 & 清空状态
+                    bad_stream_flag[si] = False
+                    stream_fail_count[si] = 0
+                    bad_stream_retry_gap[si] = BAD_FAIL_THRESHOLD
+                    if si in bad_stream_next_round:
+                        bad_stream_next_round.pop(si, None)
+                    logger.info("[A] 轮询流[%d] 恢复成功，取消坏流标记。", si)
+                else:
+                    # 恢复失败：指数退避，但尝试间隔轮数不超过 min(16, 2N)
+                    prev_gap = bad_stream_retry_gap.get(si, BAD_FAIL_THRESHOLD)
+                    new_gap = max(prev_gap * 2, BAD_FAIL_THRESHOLD)
+                    new_gap = min(new_gap, RETRY_GAP_CAP)
+                    bad_stream_retry_gap[si] = new_gap
+                    next_round = round_idx + new_gap
+                    bad_stream_next_round[si] = next_round
+                    logger.warning(
+                        "[A] 轮询流[%d] 恢复尝试失败，将在 %d 轮后再次尝试（目标轮=%d，间隔不超过 %d 轮）。",
+                        si,
+                        new_gap,
+                        next_round,
+                        RETRY_GAP_CAP,
+                    )
+
+            return _on_result
+
+        while True:
+            # 防止无流
+            if not current_streams:
+                # 等待控制消息把流加回来
+                logger.info("[A] SECURITY_POLLING 当前无流，等待控制指令 ADD_STREAM ...")
+                if not _wait_run(current_streams, initial_batch):
+                    return
+                if not current_streams:
+                    sleep(0.2)
+                    continue
+
+            # —— 一轮开始（允许在轮内动态指令；索引以本轮快照为准）——
+            round_streams_snapshot = list(current_streams)  # 快照：本轮固定集合
+            for si, item in enumerate(round_streams_snapshot):
+                # 控制优先（收控制 / 动态指令）
+                for _ in range(4):
+                    res = drain_ctrl_once(current_streams, initial_batch)
+                    if res == "STOP":
+                        return
+                    if not running or paused:
+                        sleep(0.01)
+                if not running or paused:
+                    continue
+
+                # 恢复 → 跳直播点：清标志、每路相对轴清零、队列已清
+                if resume_jump_to_live:
+                    for k in stream_t0_rel.keys():
+                        stream_t0_rel[k] = 0.0
+                    resume_jump_to_live = False
+                    logger.info("[A] 轮询：已对齐直播点（各路相对轴清零）。")
+
+                # 坏流处理：若标记为坏流，则按轮次决定“跳过”还是“尝试恢复（切 1 次）”
+                if bad_stream_flag.get(si):
+                    nr = bad_stream_next_round.get(si)
+                    if nr is None:
+                        # 理论上不应出现；兜底：按当前轮后 BAD_FAIL_THRESHOLD 轮再试
+                        gap = bad_stream_retry_gap.get(si, BAD_FAIL_THRESHOLD)
+                        gap = min(max(gap, BAD_FAIL_THRESHOLD), RETRY_GAP_CAP)
+                        bad_stream_retry_gap[si] = gap
+                        nr = polling_round_index + gap
+                        bad_stream_next_round[si] = nr
+
+                    if polling_round_index < nr:
+                        # 尚未到恢复尝试轮：完全跳过该流本轮的切片
+                        logger.debug(
+                            "[A] 轮询流[%d] 为坏流状态，目标恢复轮=%d，本轮(%d)跳过。",
+                            si,
+                            nr,
+                            polling_round_index,
+                        )
+                        continue
+                    else:
+                        # 到达恢复轮次：只切 1 个窗口进行探测
+                        try:
+                            rtsp_url = item.rtsp_url
+                        except Exception:
+                            logger.warning("[A] 轮询恢复：流[%d] 无效条目，跳过。", si)
+                            continue
+
+                        rtsp_prompt_obj = getattr(item, "rtsp_system_prompt", None) \
+                            or getattr(item, "rtsp_prompt", None)
+
+                        on_result = _make_on_result(si, polling_round_index)
+                        ok = _cut_emit_once(
+                            src_url=rtsp_url,
+                            segment_index=global_seg_idx,
+                            tag_prefix=f"rtsp_s{si:02d}",
+                            have_audio=have_audio_track,
+                            stream_index=si,                                # 使用“本轮快照索引”对齐前端
+                            stream_seg_index=stream_seg_index.get(si, 0),   # 每路累计 seg
+                            polling_round_index=polling_round_index,
+                            rtsp_system_prompt=rtsp_prompt_obj,
+                            step_hint_t0=stream_t0_rel.get(si, 0.0),
+                            window_index_in_stream=0,
+                            on_result=on_result,
+                        )
+                        if not ok:
+                            return
+
+                        global_seg_idx += 1
+                        stream_seg_index[si] = stream_seg_index.get(si, 0) + 1
+                        stream_t0_rel[si] = stream_t0_rel.get(si, 0.0) + cut_window_sec
+                        sleep(0.003)
+                        # 本轮内不再对这路多切，继续下一个流
+                        continue
+
+                # 正常流：按配置的 cuts 进行切片，并统计失败次数
+                try:
+                    rtsp_url = item.rtsp_url
+                except Exception:
+                    logger.warning("[A] 轮询：遇到非法 RTSP 条目，跳过。")
+                    continue
+
+                cuts = 1
+                try:
+                    cuts = max(1, int(getattr(item, "rtsp_cut_number", 1)))
+                except Exception:
+                    pass
+
+                rtsp_prompt_obj = getattr(item, "rtsp_system_prompt", None) \
+                    or getattr(item, "rtsp_prompt", None)
+
+                for k in range(cuts):
+                    on_result = _make_on_result(si, polling_round_index)
+                    ok = _cut_emit_once(
+                        src_url=rtsp_url,
+                        segment_index=global_seg_idx,
+                        tag_prefix=f"rtsp_s{si:02d}",
+                        have_audio=have_audio_track,
+                        stream_index=si,                                # 使用“本轮快照索引”对齐前端
+                        stream_seg_index=stream_seg_index.get(si, 0),   # 每路累计 seg
+                        polling_round_index=polling_round_index,
+                        rtsp_system_prompt=rtsp_prompt_obj,
+                        step_hint_t0=stream_t0_rel.get(si, 0.0),
+                        window_index_in_stream=k,
+                        on_result=on_result,
+                    )
+                    if not ok:
+                        return
+
+                    global_seg_idx += 1
+                    stream_seg_index[si] = stream_seg_index.get(si, 0) + 1
+                    stream_t0_rel[si] = stream_t0_rel.get(si, 0.0) + cut_window_sec
+                    sleep(0.003)
+
+            # ——一轮结束：应用“轮内”动态变更，重建映射，并进入轮询间隔——
+            _rebuild_per_stream_maps()
+            polling_round_index += 1
+
+            # 轮询间隔：A 侧再做一次兜底，保证 >=10s
+            try:
+                interval = float(initial_batch.polling_batch_interval)
+            except Exception:
+                interval = 10.0
+
+            if interval < 10.0:
+                logger.warning(
+                    "[A] 轮询间隔过小(%.3fs)，按 10s 兜底。",
+                    interval,
+                )
+                interval = 10.0
+                try:
+                    initial_batch.polling_batch_interval = interval
+                except Exception:
+                    pass
+
+            if interval > 0:
+                wait_until = now_ts() + interval
+
+                now_date_formatted, wait_date_formatted = get_now_wait_formatted_time(wait_until)
+                logger.info(
+                    f"[A] {now_date_formatted} 本轮轮询结束, 进入间隔等待 {interval}s, "
+                    f"预计将在 {wait_date_formatted} 开始下一轮循环"
+                )
+                while True:
+                    # 先处理各种控制指令（STOP / START / PAUSE / RESUME / 动态改流）
+                    res = drain_ctrl_once(current_streams, initial_batch)
+                    if res == "STOP":
+                        logger.info("[A] 收到 STOP 退出")
+                        return
+
+                    # 如果处于未 start 或 PAUSE 状态，这里直接挂起，直到恢复
+                    if (not running) or paused:
+                        logger.info("[A] 间隔等待中收到 PAUSE/未启动，挂起直到 RESUME/START ...")
+                        # 等到 running 且不再 paused
+                        if not _wait_run(current_streams, initial_batch):
+                            # _wait_run 返回 False 说明收到 STOP
+                            logger.info("[A] _wait_run 返回 STOP，退出间隔等待")
+                            return
+
+                        # 从 PAUSE/未启动 状态恢复以后，把间隔计时重新开始算
+                        wait_until = now_ts() + interval
+                        now_date_formatted, wait_date_formatted = get_now_wait_formatted_time(wait_until)
+                        logger.info(
+                            f"[A] {now_date_formatted} 从 PAUSE/未启动 恢复，间隔重新计时 {interval}s, "
+                            f"预计将在 {wait_date_formatted} 开始下一轮循环"
+                        )
+                        continue
+
+                    # 已经是 running 且非 paused，检查是否等够时间
+                    if now_ts() >= wait_until:
+                        break
+
+                    sleep(0.1)
+
+    # ===================== 主流程入口 =====================
+    try:
+        # 等待 START
+        if not _wait_run():
+            return
+
+        if cur_mode == MODEL.OFFLINE:
+            if not url:
+                logger.error("[A] OFFLINE 模式需要本地文件 url。")
+                return
+            _loop_offline(url)
+
+        elif cur_mode == MODEL.SECURITY_SINGLE:
+            if not (
+                rtsp_batch_config
+                and rtsp_batch_config.polling_list
+                and rtsp_batch_config.polling_list[0].rtsp_url
+            ):
+                logger.error("[A] SECURITY_SINGLE 需要 rtsp_batch_config.polling_list[0].rtsp_url")
+                return
+            first = rtsp_batch_config.polling_list[0]
+            prompt_obj = getattr(first, "rtsp_system_prompt", None) or getattr(first, "rtsp_prompt", None)
+            _loop_single_rtsp(first.rtsp_url, prompt_obj)
+
+        elif cur_mode == MODEL.SECURITY_POLLING:
+            if not (
+                rtsp_batch_config
+                and rtsp_batch_config.polling_list
+                and len(rtsp_batch_config.polling_list) >= 2
+            ):
+                logger.error("[A] SECURITY_POLLING 需要至少 2 条流")
+                return
+            _loop_polling_rtsp(rtsp_batch_config)
+
+        else:
+            logger.error("[A] 未知模式：%s", cur_mode)
+
     except Exception as e:
-        logger.error(f"[A] 运行时异常，线程退出：{e}")
+        logger.error(f"[A] 运行异常：{e}")
     finally:
-        logger.info('[A] 线程退出清理完成')
+        logger.info("[A] 线程退出清理完成")
