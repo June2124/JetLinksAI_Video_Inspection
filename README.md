@@ -48,58 +48,7 @@
 ---
 
 ## 🗺️ 架构概览
-
-```mermaid
-flowchart TB
-    %% ========== 顶层入口 ==========
-    API["HTTP API / SSE<br/>(FastAPI)"]
-
-    %% ========== 调度器 ==========
-    SA["StreamingAnalyze 调度器<br/>(模式 / 队列 / Worker / 任务)"]
-
-    %% ========== 队列 ==========
-    QCTRL["控制队列<br/>Q_CTRL_A/B/C"]
-    QEVENT["事件队列<br/>Q_EVENTS"]
-    QVIDEO["视频队列<br/>Q_VIDEO"]
-    QAUDIO["音频队列<br/>Q_AUDIO"]
-    QVLM["VLM 结果队列<br/>Q_VLM"]
-    QASR["ASR 结果队列<br/>Q_ASR"]
-
-    %% ========== Workers ==========
-    subgraph WORKERS["Worker 流水线"]
-        A["Worker A<br/>视频切片 & 关键帧"]
-        B["Worker B<br/>VLM 分析"]
-        C["Worker C<br/>ASR 转写"]
-    end
-
-    %% ========== RuntimeMachine ==========
-    RTM["LocalVlmRuntimeMachine<br/>(动态调节 cut_window_sec / polling_batch_interval)"]
-
-    %% 顶层调用关系
-    API --> SA
-
-    %% 调度器管理队列与 Worker
-    SA --> QCTRL
-    SA --> QEVENT
-    SA --> A
-    SA --> B
-    SA --> C
-
-    %% A 产出 → B / C
-    A --> QVIDEO --> B
-    A --> QAUDIO --> C
-
-    %% B / C 产出 → 事件总线
-    B --> QVLM --> QEVENT
-    C --> QASR --> QEVENT
-
-    %% SSE / 上层消费事件
-    QEVENT --> API
-
-    %% RuntimeMachine 侧向调节
-    RTM -. 调节参数 .-> SA
-
-```mermaid
+![系统极简架构图](./system_architecture.jpg)
 
 ## 4. 运行模式
 - OFFLINE：离线音/视频解析
