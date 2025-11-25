@@ -9,10 +9,10 @@
 作为企业级 **「视频智能巡检能力层」**，聚焦解决：
 
 - 多路 RTSP 统一管理与轮询巡检
-- 视频按时间窗口切片 + 关键帧抽取
+- 视频按时间窗口切片 + 自适应关键帧抽取
 - 本地/云端 VLM 安防事件检测与画面理解
 - 本地/云端 ASR 语音转写
-- SSE 实时结果推送与任务管理（启动/暂停/停止）
+- 利用算能边缘计算盒子Sophon SDK 部署的本地Bmodel模型, 完成视觉描述与安防任务
 
 典型应用：工厂 / 园区 / 楼宇安防巡检、大规模历史视频离线分析、边缘端多模态推理服务。
 
@@ -22,53 +22,84 @@
 
 - **多路 RTSP 轮询**
   - 支持 **2–50 路摄像头** 轮询
-  - 每路可独立设置 `rtsp_cut_number`、系统提示词
+  - 每路可独立设置 切窗个数、系统提示词
   - 运行时可动态增删流、调整轮询间隔
 
 - **多模态流水线**
   - 视频切片 + 关键帧抽取 → VLM 推理 → ASR 转写
-  - 支持本地 Qwen-VL（TPU）与云端 VLM 切换
+  - 支持本地 Qwen-VL（Sophon TPU）与云端 VLM 切换
   - 支持本地 / 云端 ASR，统一输出时序文本
 
 - **安防场景抽象**
-  - 内置 `VLM_SYSTEM_PROMPT_PRESET`，覆盖 10 个安防/合规场景
-  - 每个场景 5–6 条监督目标，统一事件结构与输出格式
+  - 内置 系统提示词，覆盖 10 个安防/合规场景
+  - 每个场景 3 条监督目标，统一事件结构与严格JSON输出格式
 
 - **自适应性能调节**
-  - `LocalVlmRuntimeMachine` 基于推理延迟自动调整：
+  - 本地多模态模型运行时状态机能够基于推理延迟自动调整：
     - 切片窗口 `cut_window_sec`
     - 轮询间隔 `polling_batch_interval`
   - 面向算力受限设备的稳定运行能力
 
 - **工程化与扩展性**
   - 基于 FastAPI + Pydantic，配置严格校验
-  - 多队列 + `_STOP` 标识的 Worker 协调，支持暂停/恢复/优雅退出
+  - 多队列 + `_STOP` 标识的 Worker 事件总线协调，支持暂停/恢复/优雅退出
   - SSE 事件总线易于对接前端与 IoT 平台
 
 ---
 
-## 3. 架构概览
+## 🗺️ 架构概览
 
-```text
-        HTTP API / SSE
-              │
-      ┌──────▼────────┐
-      │ StreamingAnalyze │  ← 调度器：模式/队列/Worker/任务
-      └──────┬────────┘
-   Q_CTRL_A/B/C │      Q_EVENTS
-        ┌──────▼───────┐
-        │ Worker A: 切窗 & 关键帧抽取  │
-        └──────┬───────┘
-          Q_VIDEO │ Q_AUDIO
-        ┌──────▼───────┐
-        │ Worker B: VLM │───▶ 结构化事件 / 描述
-        └──────┬───────┘
-          Q_ASR │
-        ┌──────▼───────┐
-        │ Worker C: ASR │───▶ 转写文本
-        └──────────────┘
+```mermaid
+flowchart TB
+    %% ========== 顶层入口 ==========
+    API["HTTP API / SSE<br/>(FastAPI)"]
 
-RuntimeMachine: 动态调整 cut_window_sec / polling_batch_interval
+    %% ========== 调度器 ==========
+    SA["StreamingAnalyze 调度器<br/>(模式 / 队列 / Worker / 任务)"]
+
+    %% ========== 队列 ==========
+    QCTRL["控制队列<br/>Q_CTRL_A/B/C"]
+    QEVENT["事件队列<br/>Q_EVENTS"]
+    QVIDEO["视频队列<br/>Q_VIDEO"]
+    QAUDIO["音频队列<br/>Q_AUDIO"]
+    QVLM["VLM 结果队列<br/>Q_VLM"]
+    QASR["ASR 结果队列<br/>Q_ASR"]
+
+    %% ========== Workers ==========
+    subgraph WORKERS["Worker 流水线"]
+        A["Worker A<br/>视频切片 & 关键帧"]
+        B["Worker B<br/>VLM 分析"]
+        C["Worker C<br/>ASR 转写"]
+    end
+
+    %% ========== RuntimeMachine ==========
+    RTM["LocalVlmRuntimeMachine<br/>(动态调节 cut_window_sec / polling_batch_interval)"]
+
+    %% 顶层调用关系
+    API --> SA
+
+    %% 调度器管理队列与 Worker
+    SA --> QCTRL
+    SA --> QEVENT
+    SA --> A
+    SA --> B
+    SA --> C
+
+    %% A 产出 → B / C
+    A --> QVIDEO --> B
+    A --> QAUDIO --> C
+
+    %% B / C 产出 → 事件总线
+    B --> QVLM --> QEVENT
+    C --> QASR --> QEVENT
+
+    %% SSE / 上层消费事件
+    QEVENT --> API
+
+    %% RuntimeMachine 侧向调节
+    RTM -. 调节参数 .-> SA
+
+```mermaid
 
 ## 4. 运行模式
 - OFFLINE：离线音/视频解析
