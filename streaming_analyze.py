@@ -2,7 +2,7 @@ from __future__ import annotations
 '''
 Author: 13594053100@163.com
 Date: 2025-10-17 15:21:53
-LastEditTime: 2025-11-24 15:52:19
+LastEditTime: 2025-11-25 15:07:36
 '''
 
 import os
@@ -22,7 +22,7 @@ from src.configs.rtsp_batch_config import RTSPBatchConfig, RTSP
 from src.configs.runtime_machine_config import RuntimeMachineConfig
 from src.runtime_machine.local_vlm_runtime_machine import LocalVlmRuntimeMachine
 from src.runtime_machine.queue_runtime_machine import QueueRuntimeMachine
-from JetLinksAI.src.utils.ffmpeg.python_ffmpeg_utils import (
+from src.utils.ffmpeg.python_ffmpeg_utils import (
     ensure_ffmpeg,
     have_audio_track,
 )

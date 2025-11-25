@@ -1,7 +1,7 @@
 '''
 Author: 13594053100@163.com
 Date: 2025-10-24 15:47:23
-LastEditTime: 2025-11-12 16:57:43
+LastEditTime: 2025-11-25 15:06:02
 '''
 
 from __future__ import annotations
@@ -15,8 +15,8 @@ from datetime import datetime
 from typing import Optional, Dict, Any, Iterable, List, Tuple
 
 from src.configs.asr_config import AsrConfig
-from JetLinksAI.src.utils.asr_client.cloud_asr_client import CloudASRClient
-from JetLinksAI.src.utils.asr_client.local_sophon_asr_client import LocalASRClient
+from src.utils.asr_client.cloud_asr_client import CloudASRClient
+from src.utils.asr_client.local_sophon_asr_client import LocalASRClient
 
 logger = logging.getLogger("src.workers.worker_c_asr")
 
