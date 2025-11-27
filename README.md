@@ -128,7 +128,7 @@ R^{(t)} =
 \mathbf{1}\!\left(\left|I_c^{(t)}(u,v) - I_c^{(t-1)}(u,v)\right| > \varepsilon\right)
 $$
 
-其中 $\varepsilon$ 为微小阈值，$\mathbf{1}(\cdot)$ 为指示函数。$R^{(t)} \in [0,1]$，越大表示像素发生变化的比例越高。
+其中 $\varepsilon$ 为微小阈值，$1(\cdot)$ 为指示函数。$R^{t}\in[0,1]$，越大表示像素发生变化的比例越高。
 
 
 ### 4. 关键帧打分与选取
