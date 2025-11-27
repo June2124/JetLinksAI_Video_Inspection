@@ -101,7 +101,7 @@ $$t_i = t_0 + \frac{i}{\mathrm{fps}}$$
 对两帧灰度向量 $t,t-1$，先定义：
 
 $$\mu_{t}=\frac{1}{t}\sum\limits_{k=1}^{t}x_{k}, \qquad
-\sigma^{2}_{t-1}=\frac{1}{t-1}\sum\limits_{k=1}^{t-1}(x_{k}-\mu_{t-1})^{2}$$
+\mu_{t-1}=\frac{1}{t-1}\sum\limits_{k=1}^{t-1}x_{k}$$
 
 $$\sigma^{2}_{t}=\frac{1}{t}\sum\limits_{k=1}^{t}(x_{k}-\mu_{t})^{2}, \qquad
 \sigma_(t-1)^2 = \frac{1}{t-1}\sum_{k=1}^(t-1) (y_k - \mu_(t-1))^2$$
