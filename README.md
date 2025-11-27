@@ -84,43 +84,52 @@
 - 阈值可由上游显式配置，也可在采集到一定数量样本后自动估计，内部带有「最小调整间隔」「硬上下限」和「多轮稳定后 snap 回基础值」等保护逻辑，避免频繁抖动。
 
 ## 🧩 自适应关键帧抽取算法简述
-关键帧选择逻辑实现于 `worker_a_cut.py` 的 `pick_best_change_frame_with_pts`，步骤大致如下：
+关键帧选择逻辑实现于 `worker_a_cut.py` 的 `pick_best_change_frame_with_pts`，核心思路是：对每段切片做稀疏采样，然后用「颜色变化比例 + 结构相似度」计算变化得分，从中选出若干关键帧。
 
-1. **候选帧采样**  
-   对每个切片 `video_path` 按步长 `stride` 做稀疏采样（不会遍历全部帧），得到若干候选帧，并为每帧记录帧号 `idx` 和相对时间戳：
-   \[
-   \text{pts} = \text{seg\_t0} + \frac{\text{idx}}{\text{fps}}
-   \]
+1. **候选帧采样**
 
-2. **计算两类变化量**  
+   对每个切片 `video_path`，按步长 `stride` 从头到尾稀疏采样若干帧作为候选，并记录帧号 `idx` 与相对时间戳：
+
+   $$\mathrm{pts} = \mathrm{seg\_t0} + \frac{\mathrm{idx}}{\mathrm{fps}}$$
+
+2. **计算两类变化量**
+
    对每个候选帧，先缩放到固定宽度并转灰度，然后与上一候选帧计算：
-   - `bgr_ratio_score`：颜色变化比例，范围 \([0,1]\)，越大说明像素有变化的比例越高；
-   - `ssim_gray`：灰度图结构相似度 SSIM，范围 \([0,1]\)，越大说明越相似。
 
-   其中 SSIM 采用标准形式：对两帧灰度向量 \(x,y\)（长度 \(N\)），
-   - \(\mu_x,\mu_y\)：均值，\(\sigma_x^2,\sigma_y^2\)：方差，\(\sigma_{xy}\)：协方差；
-   - 常数 \(C_1=(0.01\times255)^2,\ C_2=(0.03\times255)^2\)。
+   - `bgr_ratio_score`：颜色变化比例，范围 $[0,1]$，越大说明像素有变化的比例越高；
+   - `ssim_gray`：灰度图结构相似度 SSIM，范围 $[0,1]$，越大说明两帧越相似。
 
-   则有
-   $$
-   \mathrm{SSIM}(x,y)
-   = \frac{(2\mu_x\mu_y + C_1)(2\sigma_{xy} + C_2)}
-          {(\mu_x^2 + \mu_y^2 + C_1)(\sigma_x^2 + \sigma_y^2 + C_2)}
-   $$
+   对两帧灰度向量 $x,y$（长度为 $N$），先定义：
 
-3. **关键帧打分与选取**  
-   对当前帧的变化得分定义为
-   $$
-   \text{score}
-   = \alpha_{\text{bgr}}\cdot \text{bgr\_ratio\_score}
-     + (1-\alpha_{\text{bgr}})\cdot (1-\mathrm{SSIM})
-   $$
-   其中 `alpha_bgr` 控制「颜色变化」与「结构变化」的权重。
+   $$\mu_x = \frac{1}{N}\sum_{i=1}^N x_i,\quad
+     \mu_y = \frac{1}{N}\sum_{i=1}^N y_i$$
 
-   函数对所有候选帧按 `score` 降序排序，取前 `topk_frames` 个，再按帧号升序排好时间顺序，将对应帧写入 `out_dir`，最终返回：
-   - 关键帧路径 `paths`
-   - 相对时间戳 `pts_list`
-   - 帧索引 `idxs`
+   $$\sigma_x^2 = \frac{1}{N}\sum_{i=1}^N (x_i - \mu_x)^2,\quad
+     \sigma_y^2 = \frac{1}{N}\sum_{i=1}^N (y_i - \mu_y)^2$$
+
+   $$\sigma_{xy} = \frac{1}{N}\sum_{i=1}^N (x_i - \mu_x)(y_i - \mu_y)$$
+
+   取常数 $C_1 = (0.01 \times 255)^2,\ C_2 = (0.03 \times 255)^2$，则 SSIM 为：
+
+   $$\mathrm{SSIM}(x,y) =
+     \frac{(2\mu_x\mu_y + C_1)(2\sigma_{xy} + C_2)}
+          {(\mu_x^2 + \mu_y^2 + C_1)(\sigma_x^2 + \sigma_y^2 + C_2)}$$
+
+3. **关键帧打分与选取**
+
+   当前帧的变化得分定义为：
+
+   $$\mathrm{score}
+     = \alpha_{\mathrm{bgr}} \cdot \mathrm{bgr\_ratio\_score}
+       + (1 - \alpha_{\mathrm{bgr}})\cdot (1 - \mathrm{SSIM})$$
+
+   其中 `alpha_bgr` 即 $\alpha_{\mathrm{bgr}}$，控制「颜色变化」与「结构变化」的权重。  
+   函数对所有候选帧按 `score` 降序排序，取前 `topk_frames` 个，再按帧号升序排成时间顺序，将对应帧写入 `out_dir`，最终返回：
+
+   - 关键帧路径列表 `paths`
+   - 相对时间戳列表 `pts_list`
+   - 帧索引列表 `idxs`
+
 
 
 
