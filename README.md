@@ -84,98 +84,44 @@
 - 阈值可由上游显式配置，也可在采集到一定数量样本后自动估计，内部带有「最小调整间隔」「硬上下限」和「多轮稳定后 snap 回基础值」等保护逻辑，避免频繁抖动。
 
 ## 🧩 自适应关键帧抽取算法简述
-本项目的关键帧选取逻辑就在 `worker_a_cut.py` 的 `pick_best_change_frame_with_pts` 中实现。对于每个切片文件 `video_path`，算法不会遍历所有帧，而是按步长 `stride` 做子采样：
+关键帧选择逻辑实现于 `worker_a_cut.py` 的 `pick_best_change_frame_with_pts`，步骤大致如下：
 
-- 若视频总帧数为 `total`，则：
-  \[
-  \text{stride} =
-  \begin{cases}
-  \max\bigl(1,\ \lfloor \text{total} / \text{EXPECT\_CANDS} \rfloor\bigr), & \text{total} > 0 \\
-  \max\bigl(1,\ \text{round}(\text{fps} / 4)\bigr), & \text{total} = 0
-  \end{cases}
-  \]
-  这样每段切片最多产生约 `EXPECT_CANDS` 个候选帧。
+1. **候选帧采样**  
+   对每个切片 `video_path` 按步长 `stride` 做稀疏采样（不会遍历全部帧），得到若干候选帧，并为每帧记录帧号 `idx` 和相对时间戳：
+   \[
+   \text{pts} = \text{seg\_t0} + \frac{\text{idx}}{\text{fps}}
+   \]
 
-对每个被采样到的帧，先用 `resize_keep_w` 将宽度缩放到固定 `RESIZE_W`，得到小图 `small`，再转为灰度 `gray`。从第二个候选开始，与前一个候选帧计算**两类变化量**：
+2. **计算两类变化量**  
+   对每个候选帧，先缩放到固定宽度并转灰度，然后与上一候选帧计算：
+   - `bgr_ratio_score`：颜色变化比例，范围 \([0,1]\)，越大说明像素有变化的比例越高；
+   - `ssim_gray`：灰度图结构相似度 SSIM，范围 \([0,1]\)，越大说明越相似。
 
-1. **颜色变化比例（bgr_ratio_score）**  
-   对两帧 BGR 小图 \(B^{(t-1)}, B^{(t)} \in \mathbb{R}^{H \times W \times 3}\)，定义差分：
-   \[
-   D = |B^{(t)} - B^{(t-1)}|
-   \]
-   将 \(D\) 展平成长度为 \(3HW\) 的向量，记非零元素个数为 \(\text{nz}(D)\)，则：
-   \[
-   \mathrm{bgr\_ratio\_score}
-   = \frac{\text{nz}(D)}{3HW}
-   \in [0, 1]
-   \]
-   越接近 1，说明像素有变化的比例越大，颜色/纹理变化越明显。
+   其中 SSIM 采用标准形式：对两帧灰度向量 \(x,y\)（长度 \(N\)），
+   - \(\mu_x,\mu_y\)：均值，\(\sigma_x^2,\sigma_y^2\)：方差，\(\sigma_{xy}\)：协方差；
+   - 常数 \(C_1=(0.01\times255)^2,\ C_2=(0.03\times255)^2\)。
 
-2. **结构相似性（ssim_gray）**  
-   对两帧灰度小图 \(G^{(t-1)}, G^{(t)}\)（大小同为 \(H \times W\)），展平为向量
-   \[
-   x, y \in \mathbb{R}^{N},\quad N = HW
-   \]
-   定义：
-   \[
-   \mu_x = \frac{1}{N}\sum_{i=1}^N x_i,\quad
-   \mu_y = \frac{1}{N}\sum_{i=1}^N y_i
-   \]
-   \[
-   \sigma_x^2 = \frac{1}{N}\sum_{i=1}^N (x_i - \mu_x)^2,\quad
-   \sigma_y^2 = \frac{1}{N}\sum_{i=1}^N (y_i - \mu_y)^2
-   \]
-   \[
-   \sigma_{xy} = \frac{1}{N}\sum_{i=1}^N (x_i - \mu_x)(y_i - \mu_y)
-   \]
-   令
-   \[
-   C_1 = (0.01 \times 255)^2,\quad
-   C_2 = (0.03 \times 255)^2
-   \]
-   则本项目实现的 SSIM 为：
-   \[
-   \mathrm{SSIM}(x, y)
+   则有
+   $$
+   \mathrm{SSIM}(x,y)
    = \frac{(2\mu_x\mu_y + C_1)(2\sigma_{xy} + C_2)}
           {(\mu_x^2 + \mu_y^2 + C_1)(\sigma_x^2 + \sigma_y^2 + C_2)}
-   \]
-   并在代码中将其裁剪到 \([0,1]\) 区间（越大越相似）。
+   $$
 
-综合上述两个量，关键帧的打分函数为：
+3. **关键帧打分与选取**  
+   对当前帧的变化得分定义为
+   $$
+   \text{score}
+   = \alpha_{\text{bgr}}\cdot \text{bgr\_ratio\_score}
+     + (1-\alpha_{\text{bgr}})\cdot (1-\mathrm{SSIM})
+   $$
+   其中 `alpha_bgr` 控制「颜色变化」与「结构变化」的权重。
 
-\[
-\begin{aligned}
-\mathrm{score}^{(t)} 
-&= \alpha_{\mathrm{bgr}} \cdot \mathrm{bgr\_ratio\_score}^{(t)}
-  + (1 - \alpha_{\mathrm{bgr}}) \cdot \bigl(1 - \mathrm{SSIM}(G^{(t-1)}, G^{(t)})\bigr) \\
-&= \alpha_{\mathrm{bgr}} \cdot R^{(t)}
-  + (1 - \alpha_{\mathrm{bgr}})\biggl(1
-  - \frac{(2\mu_x\mu_y + C_1)(2\sigma_{xy} + C_2)}
-         {(\mu_x^2 + \mu_y^2 + C_1)(\sigma_x^2 + \sigma_y^2 + C_2)}\biggr)
-\end{aligned}
-\]
+   函数对所有候选帧按 `score` 降序排序，取前 `topk_frames` 个，再按帧号升序排好时间顺序，将对应帧写入 `out_dir`，最终返回：
+   - 关键帧路径 `paths`
+   - 相对时间戳 `pts_list`
+   - 帧索引 `idxs`
 
-其中 \(\alpha_{\mathrm{bgr}}\) 就是 `alpha_bgr` 参数（默认 0.5），控制“颜色变化比例”和“结构变化程度”的权重。得分越高，说明该帧相对上一候选帧变化越明显。
-
-算法会为每个候选帧记录：
-
-- 帧索引 `cur_idx`；
-- 相对时间戳：
-  \[
-  \text{pts} = \text{seg\_t0} + \frac{\text{cur\_idx}}{\text{fps}}
-  \]
-- 原始 BGR 帧数据（用于最终落盘）。
-
-最终步骤：
-
-1. 对所有候选 `(score, cur_idx, pts, frame)` 按 `score` 降序排序；
-2. 取前 `topk_frames` 个（默认 1 个），再按 `cur_idx` 升序排序保证时间顺序；
-3. 将选中的帧写入 `out_dir`，文件名包含 `tag` 和帧号，返回：
-   - 关键帧路径列表 `paths`，
-   - 对应 `pts` 列表（相对段起点秒），
-   - 帧索引列表 `idxs`。
-
-在 `worker_a_cut` 下游，这些信息会被打包到 `payload_video["keyframes"]`、`["frame_pts"]`、`["frame_indices"]` 等字段中，并同时推算出绝对时间戳（epoch / ISO），便于 VLM Worker 精确对齐画面时刻。
 
 
 
