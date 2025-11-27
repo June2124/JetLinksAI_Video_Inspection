@@ -1,7 +1,7 @@
 '''
 Author: 13594053100@163.com
 Date: 2025-10-08 08:41:48
-LastEditTime: 2025-11-20 17:44:04
+LastEditTime: 2025-11-25 17:54:03
 '''
 
 from enum import Enum
@@ -18,8 +18,6 @@ class SOURCE_KIND(Enum):
     VIDEO_FILE = "video_file"
     # 实时流
     RTSP = "rtsp"
-
-from enum import Enum
 
 
 class VLM_SYSTEM_PROMPT_PRESET(Enum):

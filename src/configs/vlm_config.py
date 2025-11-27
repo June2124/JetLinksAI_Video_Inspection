@@ -1,7 +1,7 @@
 '''
 Author: 13594053100@163.com
 Date: 2025-10-24 15:47:27
-LastEditTime: 2025-11-18 14:08:35
+LastEditTime: 2025-11-25 16:58:38
 '''
 
 import os
@@ -26,7 +26,7 @@ class VlmConfig(BaseModel):
 
     # 历史上下文/事件筛选等原有配置
     vlm_task_history_enabled: bool = False
-    vlm_event_min_level: VLM_DETECT_EVENT_LEVEL = VLM_DETECT_EVENT_LEVEL.LOW
+    vlm_event_min_level: VLM_DETECT_EVENT_LEVEL = VLM_DETECT_EVENT_LEVEL.NO_RISK
 
     # 证据帧静态导出
     vlm_static_evidence_images_dir: str = os.path.join(BASE_PATH_ABSPATH,"static","evidence_images")

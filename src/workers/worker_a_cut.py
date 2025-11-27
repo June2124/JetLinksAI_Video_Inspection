@@ -30,9 +30,13 @@ from src.utils.opencv.python_opencv_utils import (
 
 logger = get_logger(__name__)
 
-RESIZE_W     = 320
+BASE_PATH = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+OUT_DIR = os.path.join(BASE_PATH,'static','out')
+os.makedirs(OUT_DIR, exist_ok=True) 
+
+RESIZE_W = 320
 EXPECT_CANDS = 16
-OUT_DIR      = "static/out"
+ 
 
 
 # ===================== 小工具 =====================
