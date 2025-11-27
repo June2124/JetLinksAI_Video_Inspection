@@ -84,69 +84,75 @@
 - 阈值可由上游显式配置，也可在采集到一定数量样本后自动估计，内部带有「最小调整间隔」「硬上下限」和「多轮稳定后 snap 回基础值」等保护逻辑，避免频繁抖动。
 
 ## 🧩 自适应关键帧抽取算法简述
-### 自适应关键帧抽取算法简述
-
 关键帧选择逻辑实现于 `worker_a_cut.py` 的 `pick_best_change_frame_with_pts`。整体流程是：对每段切片做稀疏采样，计算颜色变化率和结构相似度，然后用加权得分选出若干关键帧。
 
-1. **候选帧采样**
+---
 
-   对每个切片 `video_path`，按步长 `stride` 读取若干候选帧，并记录帧号 `i` 与相对时间戳：
-   
-   $$t_i = t_0 + \frac{i}{\mathrm{fps}}$$
-   
-   其中 $t_0$ 为该切片起始时间。
+### 1. 候选帧采样
 
-2. **结构相似度 SSIM**
+对每个切片 `video_path`，按步长 `stride` 读取若干候选帧，并记录帧号 $i$ 与相对时间戳：
 
-   对两帧灰度向量 $x,y$（长度为 $N$），先定义：
-   
-   $$\mu_x = \frac{1}{N}\sum_{k=1}^N x_k, \qquad
-     \mu_y = \frac{1}{N}\sum_{k=1}^N y_k$$
-   
-   $$\sigma_x^2 = \frac{1}{N}\sum_{k=1}^N (x_k - \mu_x)^2, \qquad
-     \sigma_y^2 = \frac{1}{N}\sum_{k=1}^N (y_k - \mu_y)^2$$
-   
-   $$\sigma_{xy} = \frac{1}{N}\sum_{k=1}^N (x_k - \mu_x)(y_k - \mu_y)$$
-   
-   取常数 $C_1 = (0.01 \times 255)^2,\ C_2 = (0.03 \times 255)^2$，则结构相似度：
-   
-   $$\operatorname{SSIM}(x,y) =
-     \frac{(2\mu_x\mu_y + C_1)(2\sigma_{xy} + C_2)}
-          {(\mu_x^2 + \mu_y^2 + C_1)(\sigma_x^2 + \sigma_y^2 + C_2)}$$
-   
-   数值被裁剪到 $[0,1]$，越大表示两帧越相似。
+$$t_i = t_0 + \frac{i}{\mathrm{fps}}$$
 
-3. **BGR 颜色变化率**
+其中 $t_0$ 为该切片起始时间。
 
-   对两帧彩色图像，记高度为 $H$、宽度为 $W$，通道 $c \in \{B,G,R\}$，像素值为 $I_c^{(t)}(u,v)$。定义颜色变化率：
-   
-   $$
-   R^{(t)} =
-   \frac{1}{3HW}
-   \sum_{c \in \{B,G,R\}} \sum_{u=1}^H \sum_{v=1}^W
-   \mathbf{1}\!\left(\left|I_c^{(t)}(u,v) - I_c^{(t-1)}(u,v)\right| > \varepsilon\right)
-   $$
-   
-   其中 $\varepsilon$ 为微小阈值，$\mathbf{1}(\cdot)$ 为指示函数。$R^{(t)} \in [0,1]$，越大表示像素发生变化的比例越高。
+---
 
-4. **关键帧打分与选取**
+### 2. 结构相似度 SSIM
 
-   对第 $t$ 个候选帧，定义变化得分：
-   
-   $$
-   s^{(t)} = \alpha_{\mathrm{bgr}} R^{(t)}
-           + (1 - \alpha_{\mathrm{bgr}})\bigl(1 - \operatorname{SSIM}^{(t)}\bigr)
-   $$
-   
-   其中 $\alpha_{\mathrm{bgr}}$ 对应代码中的 `alpha_bgr`，控制“颜色变化率”和“结构变化”的权重。
+对两帧灰度向量 $x,y$（长度为 $N$），先定义：
 
-   函数对所有候选帧按 $s^{(t)}$ 降序排序，取前 `topk_frames` 个，再按帧号升序排成时间顺序，将对应帧写入 `out_dir`，最终返回：
-   
-   - 关键帧路径列表 `paths`
-   - 相对时间戳列表 `pts_list`
-   - 帧索引列表 `idxs`
+$$\mu_x = \frac{1}{N}\sum_{k=1}^N x_k, \qquad
+\mu_y = \frac{1}{N}\sum_{k=1}^N y_k$$
 
+$$\sigma_x^2 = \frac{1}{N}\sum_{k=1}^N (x_k - \mu_x)^2, \qquad
+\sigma_y^2 = \frac{1}{N}\sum_{k=1}^N (y_k - \mu_y)^2$$
 
+$$\sigma_{xy} = \frac{1}{N}\sum_{k=1}^N (x_k - \mu_x)(y_k - \mu_y)$$
+
+取常数 $C_1 = (0.01 \times 255)^2,\ C_2 = (0.03 \times 255)^2$，则结构相似度：
+
+$$
+\text{SSIM}(x,y) =
+\frac{(2\mu_x\mu_y + C_1)(2\sigma_{xy} + C_2)}
+{(\mu_x^2 + \mu_y^2 + C_1)(\sigma_x^2 + \sigma_y^2 + C_2)}
+$$
+
+数值被裁剪到 $[0,1]$，越大表示两帧越相似。
+
+---
+
+### 3. BGR 颜色变化率
+
+对两帧彩色图像，记高度为 $H$、宽度为 $W$，通道 $c \in \{B,G,R\}$，像素值为 $I_c^{(t)}(u,v)$。定义颜色变化率：
+
+$$
+R^{(t)} =
+\frac{1}{3HW}
+\sum_{c \in \{B,G,R\}} \sum_{u=1}^H \sum_{v=1}^W
+\mathbf{1}\!\left(\left|I_c^{(t)}(u,v) - I_c^{(t-1)}(u,v)\right| > \varepsilon\right)
+$$
+
+其中 $\varepsilon$ 为微小阈值，$\mathbf{1}(\cdot)$ 为指示函数。$R^{(t)} \in [0,1]$，越大表示像素发生变化的比例越高。
+
+---
+
+### 4. 关键帧打分与选取
+
+对第 $t$ 个候选帧，定义变化得分：
+
+$$
+s^{(t)} = \alpha_{\mathrm{bgr}} R^{(t)}
++ (1 - \alpha_{\mathrm{bgr}})\bigl(1 - \text{SSIM}^{(t)}\bigr)
+$$
+
+其中 $\alpha_{\mathrm{bgr}}$ 对应代码中的 `alpha_bgr`，控制“颜色变化率”和“结构变化”的权重。
+
+函数对所有候选帧按 $s^{(t)}$ 降序排序，取前 `topk_frames` 个，再按帧号升序排成时间顺序，将对应帧写入 `out_dir`，最终返回：
+
+* 关键帧路径列表 `paths`
+* 相对时间戳列表 `pts_list`
+* 帧索引列表 `idxs`
 
 
 
