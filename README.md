@@ -135,8 +135,7 @@ $$
 对第 $t$ 个候选帧，定义变化得分：
 
 $$
-s^{(t)} = \alpha_{\mathrm{bgr}} R^{(t)}
-+ (1 - \alpha_{\mathrm{bgr}})\bigl(1 - \text{SSIM}^{(t)}\bigr)
+socre^{t}=\alpha_{bgr}R^{t}+(1-\alpha_{bgr})(1-SSIM^{t})
 $$
 
 其中 $\alpha_{\mathrm{bgr}}$ 对应代码中的 `alpha_bgr`，控制“颜色变化率”和“结构变化”的权重。
