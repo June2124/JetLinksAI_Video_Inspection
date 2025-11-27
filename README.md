@@ -90,9 +90,9 @@
 
    对每个切片 `video_path`，按步长 `stride` 从头到尾稀疏采样若干帧作为候选，并记录帧号 `idx` 与相对时间戳：
 
-   $$\mathrm{pts} = \mathrm{seg\_t0} + \frac{\mathrm{idx}}{\mathrm{fps}}$$
+   $$\text{pts} = \text{seg\_t0} + \frac{\text{idx}}{\text{fps}}$$
 
-2. **计算两类变化量**
+2. **两类变化量**
 
    对每个候选帧，先缩放到固定宽度并转灰度，然后与上一候选帧计算：
 
@@ -115,15 +115,24 @@
      \frac{(2\mu_x\mu_y + C_1)(2\sigma_{xy} + C_2)}
           {(\mu_x^2 + \mu_y^2 + C_1)(\sigma_x^2 + \sigma_y^2 + C_2)}$$
 
+   对应的 **BGR 变化率**（像素有明显变化的比例）可以写成：
+
+   $$\text{bgr\_ratio\_score} =
+     \frac{1}{3HW}\sum_{c\in\{B,G,R\}}\sum_{i=1}^H\sum_{j=1}^W
+     \mathbf{1}\big(|I_c^{(t)}(i,j) - I_c^{(t-1)}(i,j)| > \varepsilon\big)$$
+
+   其中 $H,W$ 为高度和宽度，$I_c^{(t)}$ 为时间 $t$ 时刻第 $c$ 通道的像素值，$\varepsilon$ 为微小阈值，$\mathbf{1}(\cdot)$ 为指示函数。
+
 3. **关键帧打分与选取**
 
    当前帧的变化得分定义为：
 
-   $$\mathrm{score}
-     = \alpha_{\mathrm{bgr}} \cdot \mathrm{bgr\_ratio\_score}
-       + (1 - \alpha_{\mathrm{bgr}})\cdot (1 - \mathrm{SSIM})$$
+   $$\text{score}
+     = \alpha_{\text{bgr}} \cdot \text{bgr\_ratio\_score}
+       + (1 - \alpha_{\text{bgr}})\cdot (1 - \text{SSIM})$$
 
-   其中 `alpha_bgr` 即 $\alpha_{\mathrm{bgr}}$，控制「颜色变化」与「结构变化」的权重。  
+   其中 `alpha_bgr` 即 $\alpha_{\text{bgr}}$，控制「颜色变化」与「结构变化」的权重。
+
    函数对所有候选帧按 `score` 降序排序，取前 `topk_frames` 个，再按帧号升序排成时间顺序，将对应帧写入 `out_dir`，最终返回：
 
    - 关键帧路径列表 `paths`
