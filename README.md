@@ -135,17 +135,12 @@ $$
 对第 $t$ 个候选帧，定义变化得分：
 
 $$
-socre^{t}=\alpha_{bgr}R^{t}+(1-\alpha_{bgr})(1-SSIM^{t})
+score^{t}=\alpha_{bgr}R^{t}+(1-\alpha_{bgr})(1-SSIM^{t})
 $$
 
 其中 $\alpha_{\mathrm{bgr}}$ 对应代码中的 `alpha_bgr`，控制“颜色变化率”和“结构变化”的权重。
 
-函数对所有候选帧按 $s^{(t)}$ 降序排序，取前 `topk_frames` 个，再按帧号升序排成时间顺序，将对应帧写入 `out_dir`，最终返回：
-
-* 关键帧路径列表 `paths`
-* 相对时间戳列表 `pts_list`
-* 帧索引列表 `idxs`
-
+函数对所有候选帧按 $score^{(t)}$ 降序排序，取前 `topk_frames` 个，再按帧号升序排成时间顺序，最终得到单位窗口内的关键帧：
 
 
 
