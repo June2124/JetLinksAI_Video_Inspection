@@ -106,7 +106,7 @@ $$\mu_{t}=\frac{1}{t}\sum\limits_{k=1}^{t}x_{k}, \qquad
 $$\sigma^{2}_{t}=\frac{1}{t}\sum\limits_{k=1}^{t}(x_{k}-\mu_{t})^{2}, \qquad
 \\sigma^{2}_{t-1}=\frac{1}{t-1}\sum\limits_{k=1}^{t-1}(x_{k}-\mu_{t-1})^{2}$$
 
-$$\sigma_{t(t-1)} = \frac{1}{t}\sum_{k=1}^t (x_k - \mu_t)(y_k - \mu_(t-1))$$
+$$\sigma_{t(t-1)}=\frac{1}{t}\sum\limits_{k=1}^{t}(x_{k}-\mu_{t})(x_{k}-\mu_{t-1})$$
 
 取常数 $C_1 = (0.01 \times 255)^2,\ C_2 = (0.03 \times 255)^2$，则结构相似度：
 
