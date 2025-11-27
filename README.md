@@ -98,15 +98,15 @@ $$t_i = t_0 + \frac{i}{\mathrm{fps}}$$
 
 ### 2. 结构相似度 SSIM
 
-对两帧灰度向量 $x,y$（长度为 $N$），先定义：
+对两帧灰度向量 $t,t-1$（长度为 $N$），先定义：
 
-$$\mu_x = \frac{1}{N}\sum_{k=1}^N x_k, \qquad
-\mu_y = \frac{1}{N}\sum_{k=1}^N y_k$$
+$$\mu_t = \frac{1}{t}\sum_{k=1}^t x_k, \qquad
+\mu_t-1 = \frac{1}{t-1}\sum_{k=1}^t-1 y_k$$
 
-$$\sigma_x^2 = \frac{1}{N}\sum_{k=1}^N (x_k - \mu_x)^2, \qquad
-\sigma_y^2 = \frac{1}{N}\sum_{k=1}^N (y_k - \mu_y)^2$$
+$$\sigma_t^2 = \frac{1}{t}\sum_{k=1}^t (x_k - \mu_t)^2, \qquad
+\sigma_t-1^2 = \frac{1}{t-1}\sum_{k=1}^t-1 (y_k - \mu_t-1)^2$$
 
-$$\sigma_{xy} = \frac{1}{N}\sum_{k=1}^N (x_k - \mu_x)(y_k - \mu_y)$$
+$$\sigma_{t(t-1)} = \frac{1}{t}\sum_{k=1}^t (x_k - \mu_t)(y_k - \mu_t-1)$$
 
 取常数 $C_1 = (0.01 \times 255)^2,\ C_2 = (0.03 \times 255)^2$，则结构相似度：
 
