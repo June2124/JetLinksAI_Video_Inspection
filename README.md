@@ -113,7 +113,7 @@ $$\sigma_{xy} = \frac{1}{N}\sum_{k=1}^N (x_k - \mu_x)(y_k - \mu_y)$$
 取常数 $C_1 = (0.01 \times 255)^2,\ C_2 = (0.03 \times 255)^2$，则结构相似度：
 
 $$
-SSIM=\frac{(2\mu_{x}\mu_{y}+C_{1})(2\sigma_{xy}+C_{2})}{(u^{2}_{x}+u^{2}_{y}+C_{1})(\sigma^{2}_{x}+\sigma^{2}_{y}+C_{2})}
+\text{SSIM}=\frac{(2\mu_{x}\mu_{y}+C_{1})(2\sigma_{xy}+C_{2})}{(\mu^{2}_{x}+\mu^{2}_{y}+C_{1})(\sigma^{2}_{x}+\sigma^{2}_{y}+C_{2})}
 $$
 
 数值被裁剪到 $[0,1]$，越大表示两帧越相似。
